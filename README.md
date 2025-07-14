@@ -9,5 +9,3 @@ ONNX is an open format built to represent machine learning models, enabling them
 🛠 Examples for handling different model architectures.
 
 🔍 Utilities for verifying and inspecting ONNX models.
-
-🚀 Ready to adapt for your own models.
