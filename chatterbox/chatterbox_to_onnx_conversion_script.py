@@ -443,12 +443,56 @@ print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'condit
 
 speech_feat = cond_decoder(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
 
-#5. Export HiFTGenerator
-class HiFTGenerator(nn.Module):
+#5. Export STFTWrapper
+class STFTWrapper(nn.Module):
     def __init__(self):
         super().__init__()
         self.istft_params = model.s3gen.mel2wav.istft_params
         self.stft_window = model.s3gen.mel2wav.stft_window
+        self.f0_predictor = model.s3gen.mel2wav.f0_predictor
+        self.f0_upsamp = model.s3gen.mel2wav.f0_upsamp
+        self.m_source = model.s3gen.mel2wav.m_source
+    
+    def forward(self, speech_feat):
+        # mel->f0
+        f0 = self.f0_predictor(speech_feat)
+        # f0->source
+        s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+        s, _, _ = self.m_source(s)
+        output_sources = s.transpose(1, 2).squeeze(1)
+        spec = torch.stft(
+            output_sources,
+            self.istft_params["n_fft"], 
+            self.istft_params["hop_len"], 
+            self.istft_params["n_fft"], 
+            window=self.stft_window.to(output_sources.device),
+            return_complex=False)
+        s_stft_real, s_stft_imag = spec[..., 0], spec[..., 1]
+        s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+        return s_stft
+
+stft_wrapper = STFTWrapper()
+output_sources = stft_wrapper(speech_feat)
+torch.onnx.export(
+    stft_wrapper,
+    (speech_feat),
+    f"{output_dir}/stft_wrapper.onnx",
+    export_params=True,
+    opset_version=17,
+    input_names=["speech_feat"],
+    output_names=["s_stft"],
+    dynamic_axes={
+        'speech_feat': {0: 'batch_size', 2: 'sequence_length'},
+        's_stft': {0: 'batch_size', 1: 'frequency_samples', 2: 'number_of_frames'},
+    }
+)
+print(f"✅ STFTWrapper ONNX export is completed. Model saved as 'stft_wrapper.onnx'")
+
+#6. Export HiFTGenerator
+class HiFTGenerator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.istft_params = model.s3gen.mel2wav.istft_params
         self.conv_pre = model.s3gen.mel2wav.conv_pre
         self.num_upsamples = model.s3gen.mel2wav.num_upsamples
         self.lrelu_slope = model.s3gen.mel2wav.lrelu_slope
@@ -459,74 +503,8 @@ class HiFTGenerator(nn.Module):
         self.num_kernels = model.s3gen.mel2wav.num_kernels
         self.resblocks = model.s3gen.mel2wav.resblocks
         self.conv_post = model.s3gen.mel2wav.conv_post
-        self.audio_limit = model.s3gen.mel2wav.audio_limit
-        self.f0_predictor = model.s3gen.mel2wav.f0_predictor
-        self.f0_upsamp = model.s3gen.mel2wav.f0_upsamp
-        self.m_source = model.s3gen.mel2wav.m_source
-    
-    def _stft(self, x):
-        spec = torch.stft(
-            x,
-            self.istft_params["n_fft"], 
-            self.istft_params["hop_len"], 
-            self.istft_params["n_fft"], 
-            window=self.stft_window.to(x.device),
-            return_complex=False)
-        return spec[..., 0], spec[..., 1]
-    
-    def _manual_istft(self, real, imag):
-        """
-        real, imag: [B, F, T] float tensors (freq_bins, frames)
-        Returns: [B, waveform_len]
-        """
-        n_fft = self.istft_params["n_fft"]
-        hop_len = self.istft_params["hop_len"]
-        win_len = self.istft_params["n_fft"]
-        window = self.stft_window.to(real.device)  # [n_fft]
 
-        # Compute magnitude & phase
-        magnitude = torch.sqrt(real ** 2 + imag ** 2)
-        phase = torch.atan2(imag, real)
-
-        # Prepare inverse DFT basis
-        freqs = torch.arange(0, n_fft // 2 + 1, device=real.device)  # F
-        t = torch.arange(0, n_fft, device=real.device)               # n_fft
-        cos_part = torch.cos(2 * torch.pi * freqs[:, None] * t / n_fft)  # [F, n_fft]
-        sin_part = torch.sin(2 * torch.pi * freqs[:, None] * t / n_fft)  # [F, n_fft]
-
-        # Move frames dimension to 1st after batch: [B, T, F]
-        full_real = magnitude * torch.cos(phase)
-        full_imag = magnitude * torch.sin(phase)
-        full_real = full_real.permute(0, 2, 1)  # [B, T, F]
-        full_imag = full_imag.permute(0, 2, 1)  # [B, T, F]
-
-        # Multiply [B, T, F] × [F, n_fft] → [B, T, n_fft]
-        frames = torch.matmul(full_real, cos_part) - torch.matmul(full_imag, sin_part)
-
-        # Apply window
-        frames = frames * window[None, None, :]
-
-        # Overlap-add
-        num_frames = frames.shape[1]
-        out_len = n_fft + (num_frames - 1) * hop_len
-        waveform = torch.zeros((frames.shape[0], out_len), device=real.device)
-        for i in range(num_frames):
-            start = i * hop_len
-            waveform[:, start:start+win_len] += frames[:, i, :win_len]
-
-        return waveform
-
-    def _istft(self, magnitude, phase):
-        magnitude = torch.clip(magnitude, max=1e2)
-        real = magnitude * torch.cos(phase)
-        img = magnitude * torch.sin(phase)
-        inverse_transform = self._manual_istft(real, img)
-        return inverse_transform
-
-    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
-        s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
-        s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
-
+    def decode(self, x: torch.Tensor, s_stft: torch.Tensor) -> torch.Tensor:
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, self.lrelu_slope)
@@ -552,40 +530,37 @@ class HiFTGenerator(nn.Module):
         x = self.conv_post(x)
         magnitude = torch.exp(x[:, :self.istft_params["n_fft"] // 2 + 1, :])
         phase = torch.sin(x[:, self.istft_params["n_fft"] // 2 + 1:, :])  # actually, sin is redundancy
-
-        x = self._istft(magnitude, phase)
-        x = torch.clamp(x, -self.audio_limit, self.audio_limit)
-        return x
+        return magnitude, phase
     
-    def forward(self, speech_feat):
-        # mel->f0
-        f0 = self.f0_predictor(speech_feat)
-        # f0->source
-        s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-        s, _, _ = self.m_source(s)
-        output_sources = s.transpose(1, 2)
-        output_wavs = self.decode(x=speech_feat, s=output_sources)
-        return output_wavs, output_sources
+    def forward(self, speech_feat, output_sources):
+        magnitude, phase = self.decode(x=speech_feat, s_stft=output_sources)
+        return magnitude, phase
 
 hift_generator = HiFTGenerator()
-#test = hift_generator(speech_feat)
 torch.onnx.export(
     hift_generator,
-    (speech_feat),
+    (speech_feat, output_sources),
     f"{output_dir}/hift_generator.onnx",
     export_params=True,
     opset_version=14,
-    input_names=["speech_feat"],
-    output_names=["output_wavs", "output_sources"],
+    input_names=["speech_feat", "output_sources"],
+    output_names=["magnitude", "phase"],
     dynamic_axes={
         'speech_feat': {0: 'batch_size', 2: 'sequence_length'},
-        'output_wavs': {0: 'batch_size', 1: "sequence_length"},
-        "output_sources": {0: 'batch_size', 2: "sequence_length"},
+        "output_sources": {0: 'batch_size', 1: 'frequency_samples', 2: 'number_of_frames'},
+        "magnitude": {0: 'batch_size', 1: 'frequency_samples', 2: 'number_of_frames'},
+        "phase": {0: 'batch_size', 1: 'frequency_samples', 2: 'number_of_frames'},
     }
 )
 print(f"✅ HiFTGenerator ONNX export is completed. Model saved as 'hift_generator.onnx'")
+ort_wrapper_unput = {
+    "speech_feat": speech_feat.detach().numpy(),
+    "output_sources": output_sources.detach().numpy()
+}
+wrapper_session = onnxruntime.InferenceSession("converted/hift_generator.onnx")
+test = wrapper_session.run(None, ort_wrapper_unput)
 
-#6. Post-processing
+#7. Post-processing
 for f in os.listdir(output_dir):
     p = os.path.join(output_dir, f)
     onnxslim.slim(p, p)

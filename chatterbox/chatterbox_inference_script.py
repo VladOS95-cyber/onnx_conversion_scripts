@@ -8,11 +8,14 @@ import torch
 import torch.nn.functional as F
 from transformers.generation.logits_process import MinPLogitsWarper, RepetitionPenaltyLogitsProcessor, TopPLogitsWarper
 from tqdm import tqdm
+from scipy.signal import get_window
+import perth
 
 SPACE = "[SPACE]"
 SPEECH_VOCAB_SIZE = 6561
 SOS = SPEECH_VOCAB_SIZE
 EOS = SPEECH_VOCAB_SIZE + 1
+S3GEN_SR = 24000
 start_text_token = 255
 stop_text_token = 0
 start_speech_token = 6561
@@ -109,6 +112,8 @@ model_id = "vladislavbro/chatterbox_ONNX"
 speech_encoder_path = hf_hub_download(repo_id=model_id, filename="speech_encoder.onnx", local_dir=output_dir)
 conditional_docoder_path = hf_hub_download(repo_id=model_id, filename="conditional_decoder.onnx", local_dir=output_dir)
 flow_inference_path = hf_hub_download(repo_id=model_id, filename="flow_inference.onnx", local_dir=output_dir)
+stft_wrapper_path = hf_hub_download(repo_id=model_id, filename="stft_wrapper.onnx", local_dir=output_dir)
+hift_generator_path = hf_hub_download(repo_id=model_id, filename="hift_generator.onnx", local_dir=output_dir)
 hf_hub_download(repo_id="ResembleAI/chatterbox", filename="tokenizer.json", local_dir=output_dir)
 hf_hub_download(repo_id="ResembleAI/chatterbox", filename="conds.pt", local_dir=output_dir)
 
@@ -117,13 +122,15 @@ llama_session = onnxruntime.InferenceSession("converted/model.onnx")
 cond_decoder_session = onnxruntime.InferenceSession(conditional_docoder_path)
 speech_encoder_session = onnxruntime.InferenceSession("converted/speech_encoder.onnx")
 flow_inference_session = onnxruntime.InferenceSession(flow_inference_path)
+stft_wrapper_session = onnxruntime.InferenceSession(stft_wrapper_path)
+hift_generator_session = onnxruntime.InferenceSession(hift_generator_path)
 
 #3. Prepare input
 tokenizer = Tokenizer.from_file("converted/tokenizer.json")
-#model = ChatterboxTTS.from_pretrained(device="cpu")
+model = ChatterboxTTS.from_pretrained(device="cpu")
 text = "Ezreal and Jinx teamed up with Ahri, Yasuo, and Teemo to take down the enemy's Nexus in an epic late-game pentakill."
 #wav = model.generate(text)
-# ta.save("test-1.wav", wav, model.sr)
+#ta.save("test-1.wav", wav, model.sr)
 text = text.replace(' ', SPACE)
 text_tokens_ids = tokenizer.encode(text).ids
 text_tokens_ids = torch.IntTensor(text_tokens_ids).unsqueeze(0)
@@ -160,7 +167,7 @@ batch_size, seq_len, _ = inputs_embeds.shape
 dtype = np.float32
 cfg_weight=0.5
 temperature=0.8
-max_new_tokens = 10
+max_new_tokens = 150
 dummy_attention_mask = np.ones(inputs_embeds.shape[:2], dtype=np.int64)
 llama_input = {
     "inputs_embeds": inputs_embeds,
@@ -193,7 +200,7 @@ for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
         logits_uncond = logits[1:2]
         logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
 
-    #logits = logits.squeeze(1)
+    logits = logits.squeeze(1)
 
     # Apply temperature scaling.
     if temperature != 1.0:
@@ -267,6 +274,7 @@ mu_in = np.zeros([2, 80, T])
 t_in = np.zeros([2])
 spks_in = np.zeros([2, 80])
 cond_in = np.zeros([2, 80, T])
+sol = []
 for i in range(n_timesteps):
     dt = dt_all[i:i + 1]  # keep shape
     x_in[:] = x
@@ -289,5 +297,38 @@ for i in range(n_timesteps):
 
     x = x + dt * dphi_dt.detach().numpy()
     t = t + dt
-feat = x
-output_mels = feat[:, :, mel_len1.squeeze():]
+    sol.append(x)
+    if i < len(t_span) - 1:
+        dt = t_span[i + 1] - t
+
+output_mels = sol[-1]
+
+stft_ort_wrapper_input = {
+    "speech_feat": output_mels
+}
+output_sources = stft_wrapper_session.run(None, stft_ort_wrapper_input)
+istft_params = {"n_fft": 16, "hop_len": 4}
+def _istft(magnitude, phase):
+    stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+    magnitude = torch.clip(magnitude, max=1e2)
+    real = magnitude * torch.cos(phase)
+    img = magnitude * torch.sin(phase)
+    inverse_transform = torch.istft(torch.complex(real, img), istft_params["n_fft"], istft_params["hop_len"],
+                                    istft_params["n_fft"], window=stft_window.to(magnitude.device))
+    return inverse_transform
+hift_generator_ort_input = {
+    "speech_feat": output_mels,
+    "output_sources": output_sources[0]
+}
+magnitude, phase = hift_generator_session.run(None, hift_generator_ort_input)
+output_wavs = _istft(torch.from_numpy(magnitude), torch.from_numpy(phase))
+n_trim = S3GEN_SR // 50  # 20ms = half of a frame
+trim_fade = torch.zeros(2 * n_trim)
+trim_fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
+output_wavs[:, :len(trim_fade)] *= trim_fade
+wav = output_wavs.squeeze(0).detach().cpu().numpy()
+watermarker = perth.PerthImplicitWatermarker()
+watermarked_wav = watermarker.apply_watermark(wav, sample_rate=S3GEN_SR)
+watermarked_wav = torch.from_numpy(watermarked_wav).unsqueeze(0)
+ta.save("output.wav", watermarked_wav, S3GEN_SR)
+print("output.wav was successfully saved")
