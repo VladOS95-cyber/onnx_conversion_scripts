@@ -1,10 +1,57 @@
+
 ## ONNX Model Conversion Scripts
 
-This repository contains a collection of scripts to convert various machine learning and deep learning models into the ONNX (Open Neural Network Exchange) format.
-ONNX is an open format built to represent machine learning models, enabling them to be transferred between different frameworks.
+A collection of PyTorch-based models converted to the ONNX format, with ready-to-use ONNX Runtime inference scripts.
+All generated .onnx models stored in [Hugging Face ONNX Community](https://huggingface.co/onnx-community)
 
-📦 Scripts to convert models from popular frameworks (PyTorch, TensorFlow, etc.) to ONNX.
+This project aims to make it easier to:
 
-🛠 Examples for handling different model architectures.
+  * Convert PyTorch models to ONNX format
 
-🔍 Utilities for verifying and inspecting ONNX models.
+  * Run efficient inference using ONNX Runtime
+
+  * Learn by example, with minimal boilerplate
+
+📂 Project Structure
+
+    ├── README.md
+    ├── model_name_1/
+    │   ├── model_name_1_to_onnx_conversion_script.py  # Script to export PyTorch model to ONNX
+    │   ├── model_name_1_inference_script.py  # Script to run inference with ONNX Runtime
+    ├── model_name_2/
+    │   ├── model_name_2_to_onnx_conversion_script.py 
+    │   ├── model_name_2_inference_script.py 
+    └── ...
+
+🚀 Getting Started
+
+### 1. Clone the repository
+
+    git clone https://github.com/<your-username>/<your-repo>.git
+    cd <your-repo>
+
+### 2. Install dependencies
+    You'll need Python 3.8+ and pip:
+    pip install torch onnx onnxruntime
+
+Some models may have extra dependencies — check their **to_onnx_conversion_script.py for details.
+
+📚 Supported Models
+
+| Model Name        | Source                    | Notes                        |
+| ----------------- | ------------------------  | ---------------------------- |
+| chatterbox        | resemble-ai/chatterbox-tts| Text to speech example       |
+| ...               | ...                       | ...                          |
+
+(More models coming soon!)
+
+
+📜 License
+
+This project is licensed under the [MIT License](https://choosealicense.com/licenses/mit/)
+
+### Project author: Vladislav Bronzov
+
+### Email: vladislav.bronzov@gmail.com
+
+
