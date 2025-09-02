@@ -629,10 +629,6 @@ torch.onnx.export(
     }
 )
 print(f"✅ HiFTGenerator ONNX export is completed. Model saved as 'hift_generator.onnx'")
-ort_wrapper_unput = {
-    "speech_feat": speech_feat.detach().numpy(),
-    "output_sources": output_sources.detach().numpy()
-}
 
 #8. Post-processing
 for f in os.listdir(output_dir):
