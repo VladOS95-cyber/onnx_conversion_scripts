@@ -87,7 +87,7 @@ output_file_name = "infer_output.wav"
 model_id = "onnx-community/chatterbox-onnx"
 text = "The Lord of the Rings is the greatest work of literature."
 audio = None
-target_voice_path = "back_4_more_fun.wav"
+target_voice_path = None
 
 ## Load model
 speech_encoder_path = hf_hub_download(repo_id=model_id, filename="speech_encoder.onnx", local_dir=output_dir)
