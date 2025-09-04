@@ -126,7 +126,6 @@ def set_ref_dict(target_voice_path=None):
 ref_dict = set_ref_dict(target_voice_path)
 
 def execute_audio_to_audio_inference(audio, ref_dict):
-    assert audio != None, "provide input audio"
     print("Start Audio to Audio inference script...")
     ## Prepare input
     audio_16, _ = librosa.load(audio, sr=S3_SR)
@@ -140,7 +139,6 @@ def execute_audio_to_audio_inference(audio, ref_dict):
     return speech_tokens, token_len
 
 def execute_text_to_audio_inference(text, ref_dict, conds):
-    assert text != None, "provide input text"
     print("Start Text to Audio inference script...")
     ## Start inferense sessions
     llama_with_past_session = onnxruntime.InferenceSession(language_model_path)
