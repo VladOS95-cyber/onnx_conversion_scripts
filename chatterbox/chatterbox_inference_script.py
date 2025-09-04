@@ -2,6 +2,8 @@ import onnxruntime
 import numpy as np
 from huggingface_hub import hf_hub_download
 from chatterbox.tts import Conditionals
+from chatterbox.vc import ChatterboxVC
+from chatterbox.models.s3tokenizer import S3Tokenizer
 import torchaudio as ta
 from tokenizers import Tokenizer
 import torch
@@ -10,12 +12,16 @@ from transformers.generation.logits_process import MinPLogitsWarper, RepetitionP
 from tqdm import tqdm
 from scipy.signal import get_window
 import perth
+import librosa
 
 SPACE = "[SPACE]"
 SPEECH_VOCAB_SIZE = 6561
 SOS = SPEECH_VOCAB_SIZE
 EOS = SPEECH_VOCAB_SIZE + 1
 S3GEN_SR = 24000
+# Sampling rate of the inputs to S3TokenizerV2
+S3_SR = 16_000
+DEC_COND_LEN = 10 * S3GEN_SR
 start_text_token = 255
 stop_text_token = 0
 start_speech_token = 6561
@@ -47,34 +53,6 @@ def drop_invalid_tokens(x):
     x = x[s: e]
     return x
 
-def update_llama_input_with_new_past(llama_input, past_key_values_output):
-    """
-    Updates the llama_input dictionary with the new past_key_values
-    returned from the ONNX model forward pass.
-
-    Args:
-        llama_input (dict): The original input dict for the model.
-        past_key_values_output (list): The 60 output tensors: 30 keys and 30 values.
-    
-    Returns:
-        dict: Updated llama_input with new past_key_values.
-    """
-    assert len(past_key_values_output) == 60, "Expected 60 past_key/value tensors (30 layers)."
-
-    updated_input = llama_input.copy()  # Don't mutate original
-
-    for layer in range(30):
-        key_name = f'past_key_values_{layer}_key'
-        value_name = f'past_key_values_{layer}_value'
-        
-        key_tensor = past_key_values_output[2 * layer]
-        value_tensor = past_key_values_output[2 * layer + 1]
-
-        updated_input[key_name] = key_tensor
-        updated_input[value_name] = value_tensor
-
-    return updated_input
-
 def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
         """Make mask tensor containing indices of padded part.
 
@@ -103,168 +81,216 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
         mask = seq_range_expand >= seq_length_expand
         return mask
 
-# 1. Load model
+
 output_dir = "converted"
-output_file_name = "output.wav"
+output_file_name = "infer_output.wav"
 model_id = "onnx-community/chatterbox-onnx"
+text = "The Lord of the Rings is the greatest work of literature."
+audio = None
+target_voice_path = "back_4_more_fun.wav"
+
+## Load model
 speech_encoder_path = hf_hub_download(repo_id=model_id, filename="speech_encoder.onnx", local_dir=output_dir)
 speech_embedding_path = hf_hub_download(repo_id=model_id, filename="speech_embedding.onnx", local_dir=output_dir)
-llama_with_past_path = hf_hub_download(repo_id=model_id, filename="llama_with_past.onnx", local_dir=output_dir)
-conditional_docoder_path = hf_hub_download(repo_id=model_id, filename="conditional_decoder.onnx", local_dir=output_dir)
+language_model_path = hf_hub_download(repo_id=model_id, filename="language_model.onnx", local_dir=output_dir, subfolder='onnx')
+hf_hub_download(repo_id=model_id, filename="language_model.onnx_data", local_dir=output_dir, subfolder='onnx')
+conditional_decoder_path = hf_hub_download(repo_id=model_id, filename="conditional_decoder.onnx", local_dir=output_dir)
 flow_inference_path = hf_hub_download(repo_id=model_id, filename="flow_inference.onnx", local_dir=output_dir)
 stft_wrapper_path = hf_hub_download(repo_id=model_id, filename="stft_wrapper.onnx", local_dir=output_dir)
 hift_generator_path = hf_hub_download(repo_id=model_id, filename="hift_generator.onnx", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="tokenizer.json", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="conds.pt", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="tokenizer.json", local_dir=output_dir)
+hf_hub_download(repo_id=model_id, filename="vc_tokenizer_weights.pth", local_dir=output_dir)
+conds = Conditionals.load("converted/conds.pt")
 
-#2. Start inferense sessions
-llama_with_past_session = onnxruntime.InferenceSession(llama_with_past_path)
-speech_encoder_session = onnxruntime.InferenceSession(speech_encoder_path)
-speech_embedding_session = onnxruntime.InferenceSession(speech_embedding_path)
-cond_decoder_session = onnxruntime.InferenceSession(conditional_docoder_path)
+## Start common inferense sessions
 flow_inference_session = onnxruntime.InferenceSession(flow_inference_path)
 stft_wrapper_session = onnxruntime.InferenceSession(stft_wrapper_path)
 hift_generator_session = onnxruntime.InferenceSession(hift_generator_path)
+cond_decoder_session = onnxruntime.InferenceSession(conditional_decoder_path)
+model = ChatterboxVC.from_pretrained(device="cpu")
 
-#3. Prepare input
-tokenizer = Tokenizer.from_file(f"{output_dir}/tokenizer.json")
-text = "The Lord of the Rings is the greatest work of literature."
-text = text.replace(' ', SPACE)
-text_tokens_ids = tokenizer.encode(text).ids
-text_tokens_ids = torch.IntTensor(text_tokens_ids).unsqueeze(0)
-text_tokens_ids = torch.cat([text_tokens_ids, text_tokens_ids], dim=0)
-text_tokens_ids = F.pad(text_tokens_ids, (1, 0), value=start_text_token)
-text_tokens_ids = F.pad(text_tokens_ids, (0, 1), value=stop_text_token)
-text_tokens_ids = torch.atleast_2d(text_tokens_ids).to(dtype=torch.long)
-speech_input_ids = start_speech_token * torch.ones_like(text_tokens_ids[:, :1])
-emotion_adv= 0.5 * torch.ones(1, 1, 1)
-conds = Conditionals.load("converted/conds.pt")
-cond_prompt_speech_tokens = conds.t3.cond_prompt_speech_tokens
-speaker_emb = conds.t3.speaker_emb
+def set_target_voice(wav_fpath):
+    s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+    s3gen_ref_wav = s3gen_ref_wav[:DEC_COND_LEN]
+    ref_dict = model.s3gen.embed_ref(s3gen_ref_wav)
+    return ref_dict
 
-ort_speech_encoder_inputs = {
-    "speaker_emb": speaker_emb.cpu().numpy(),
-    "cond_prompt_speech_tokens": cond_prompt_speech_tokens.cpu().numpy(),
-    "emotion_adv": emotion_adv.cpu().numpy(),
-    "text_tokens_ids": text_tokens_ids.cpu().numpy(),
-    "speech_input_ids": speech_input_ids.cpu().numpy()
-}
-inputs_embeds, len_cond = speech_encoder_session.run(None, ort_speech_encoder_inputs)
+def set_ref_dict(target_voice_path=None):
+    ref_dict = conds.gen
+    if target_voice_path:
+        ref_dict = set_target_voice(target_voice_path)
+    return ref_dict
 
-#4. Instantiate the logits processors.
-min_p=0.05
-top_p=1.00
-repetition_penalty=1.2
-min_p_warper = MinPLogitsWarper(min_p=min_p)
-top_p_warper = TopPLogitsWarper(top_p=top_p)
-repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
-num_layers = 30
-num_key_value_heads = 16
-head_dim = 64
-batch_size, seq_len, _ = inputs_embeds.shape
-dtype = np.float32
-cfg_weight=0.5
-temperature=1e-8
-max_new_tokens = 1000
+ref_dict = set_ref_dict(target_voice_path)
 
-dummy_attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
-llama_input = {
-    "inputs_embeds": inputs_embeds,
-}
+def execute_audio_to_audio_inference(audio, ref_dict):
+    assert audio != None, "provide input audio"
+    print("Start Audio to Audio inference script...")
+    ## Prepare input
+    audio_16, _ = librosa.load(audio, sr=S3_SR)
+    audio_16 = torch.from_numpy(audio_16).float()[None, ]
+    tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
+    tokenizer.load_state_dict(torch.load("vc_tokenizer_weights.pth"))
+    speech_tokens, _ = tokenizer(audio_16)
+    speech_token_lens = torch.LongTensor([speech_tokens.size(1)])
+    prompt_token = ref_dict["prompt_token"]
+    speech_tokens, token_len = torch.concat([prompt_token, speech_tokens], dim=1), ref_dict["prompt_token_len"] + speech_token_lens
+    return speech_tokens, token_len
 
-#5. Token generation
-for layer in range(30):
-    key_name = f'past_key_values_{layer}_key'
-    value_name = f'past_key_values_{layer}_value'
-    
-    key_tensor = np.empty((batch_size, num_key_value_heads, 0, head_dim), dtype=dtype)
-    value_tensor = np.empty((batch_size, num_key_value_heads, 0, head_dim), dtype=dtype)
+def execute_text_to_audio_inference(text, ref_dict, conds):
+    assert text != None, "provide input text"
+    print("Start Text to Audio inference script...")
+    ## Start inferense sessions
+    llama_with_past_session = onnxruntime.InferenceSession(language_model_path)
+    speech_encoder_session = onnxruntime.InferenceSession(speech_encoder_path)
+    speech_embedding_session = onnxruntime.InferenceSession(speech_embedding_path)
 
-    llama_input[key_name] = key_tensor
-    llama_input[value_name] = value_tensor
-out = llama_with_past_session.run(None, llama_input)
-logits = out[0]
-past_key_values = out[1:]
-predicted = []
-bos_token = torch.tensor([[start_speech_token]], dtype=torch.long)
-generated_ids = bos_token.clone()
+    ## Prepare input
+    tokenizer = Tokenizer.from_file(f"{output_dir}/tokenizer.json")
+    text = text.replace(' ', SPACE)
+    text_tokens_ids = tokenizer.encode(text).ids
+    text_tokens_ids = torch.IntTensor(text_tokens_ids).unsqueeze(0)
+    text_tokens_ids = torch.cat([text_tokens_ids, text_tokens_ids], dim=0)
+    text_tokens_ids = F.pad(text_tokens_ids, (1, 0), value=start_text_token)
+    text_tokens_ids = F.pad(text_tokens_ids, (0, 1), value=stop_text_token)
+    text_tokens_ids = torch.atleast_2d(text_tokens_ids).to(dtype=torch.long)
+    speech_input_ids = start_speech_token * torch.ones_like(text_tokens_ids[:, :1])
+    emotion_adv= 0.5 * torch.ones(1, 1, 1)
+    cond_prompt_speech_tokens = conds.t3.cond_prompt_speech_tokens
+    speaker_emb = conds.t3.speaker_emb
 
-# ---- Generation Loop using kv_cache ----
-for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
-    logits = torch.from_numpy(logits)
-    logits = logits[:, -1, :]
-    # CFG
-    if cfg_weight > 0.0:
-        logits_cond = logits[0:1]
-        logits_uncond = logits[1:2]
-        logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
-
-    logits = logits.squeeze(1)
-
-    # Apply temperature scaling.
-    if temperature != 1.0:
-        logits = logits / temperature
-
-    # Apply repetition penalty and top‑p filtering.
-    logits = repetition_penalty_processor(generated_ids, logits)
-    logits = min_p_warper(None, logits)
-    logits = top_p_warper(None, logits)
-
-    # Convert logits to probabilities and sample the next token.
-    probs = torch.softmax(logits, dim=-1)
-    next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
-
-    predicted.append(next_token)
-    generated_ids = torch.cat([generated_ids, next_token], dim=1)
-
-    # Check for EOS token.
-    if next_token.view(-1) == stop_speech_token:
-        break
-
-    # Get embedding for the new token.
-    speech_embd_input = {
-        "next_token": next_token.detach().numpy(),
-        "idx" : np.array([i])
+    ort_speech_encoder_inputs = {
+        "speaker_emb": speaker_emb.cpu().numpy(),
+        "cond_prompt_speech_tokens": cond_prompt_speech_tokens.cpu().numpy(),
+        "emotion_adv": emotion_adv.cpu().numpy(),
+        "text_tokens_ids": text_tokens_ids.cpu().numpy(),
+        "speech_input_ids": speech_input_ids.cpu().numpy()
     }
-    next_token_embed = speech_embedding_session.run(None, speech_embd_input)
-    next_token_embed = torch.from_numpy(next_token_embed[0])
-    # next_token_embed = model.t3.speech_emb(next_token)
-    # next_token_embed = next_token_embed + model.t3.speech_pos_emb.get_fixed_embedding(i + 1)
+    inputs_embeds, _ = speech_encoder_session.run(None, ort_speech_encoder_inputs)
 
-    #  For CFG
-    if cfg_weight > 0.0:
-        next_token_embed = torch.cat([next_token_embed, next_token_embed])
+    ## Instantiate the logits processors.
+    min_p=0.05
+    top_p=1.00
+    repetition_penalty=1.2
+    min_p_warper = MinPLogitsWarper(min_p=min_p)
+    top_p_warper = TopPLogitsWarper(top_p=top_p)
+    repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
 
-    # Forward pass with only the new token and the cached past.
-    llama_input = update_llama_input_with_new_past(llama_input, past_key_values)
-    llama_input["inputs_embeds"] = next_token_embed.detach().numpy()
-    out = llama_with_past_session.run(None, llama_input)
-    past_key_values = out[1:]
-    logits = out[0]
+    num_hidden_layers = 30
+    num_key_value_heads = 16
+    head_dim = 64
+    batch_size, seq_len, _ = inputs_embeds.shape
+    cfg_weight=0.5
+    temperature=1e-8
+    max_new_tokens = 128
 
-# Concatenate all predicted tokens along the sequence dimension.
-predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
+    ## Prepare decoder inputs
+    attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
+    position_ids = np.cumsum(attention_mask, axis=1, dtype=np.int64) - 1
+    batch_size = inputs_embeds.shape[0]
+    past_key_values = {
+        f"past_key_values.{layer}.{kv}": np.zeros([batch_size, num_key_value_heads, 0, head_dim], dtype=np.float32)
+        for layer in range(num_hidden_layers)
+        for kv in ("key", "value")
+    }
 
-# Extract only the conditional batch.
-speech_tokens = predicted_tokens[0]
 
-speech_tokens = drop_invalid_tokens(speech_tokens)
-speech_tokens = speech_tokens[speech_tokens < 6561]
-speech_tokens = speech_tokens.unsqueeze(0)
-speech_token_lens = torch.LongTensor([speech_tokens.size(1)])
-prompt_token = conds.gen["prompt_token"]
-speech_tokens, token_len = torch.concat([prompt_token, speech_tokens], dim=1), conds.gen["prompt_token_len"] + speech_token_lens
+    generated_tokens = []
+    bos_token = torch.tensor([[start_speech_token]], dtype=torch.long)
+    generated_ids = bos_token.clone()
+
+    # ---- Generation Loop using kv_cache ----
+    for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
+        logits, *present_key_values = llama_with_past_session.run(None, dict(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **past_key_values,
+        ))
+
+        # TODO: UPDATE (use numpy where possible)
+        logits = torch.from_numpy(logits)
+        logits = logits[:, -1, :]
+        if cfg_weight > 0.0: # CFG
+            logits_cond = logits[0:1]
+            logits_uncond = logits[1:2]
+            logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+
+        logits = logits.squeeze(1)
+
+        # Apply temperature scaling.
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        # Apply repetition penalty and top‑p filtering.
+        logits = repetition_penalty_processor(generated_ids, logits)
+        logits = min_p_warper(None, logits)
+        logits = top_p_warper(None, logits)
+
+        # Convert logits to probabilities and sample the next token.
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
+        generated_tokens.append(next_token)
+        generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+        # Check for EOS token.
+        if (next_token.view(-1) == stop_speech_token).all():
+            break
+
+        # Get embedding for the new token.
+        speech_embd_input = {
+            "next_token": next_token.detach().numpy(),
+            "idx" : np.array([i])
+        }
+        next_token_embed = speech_embedding_session.run(None, speech_embd_input)
+        next_token_embed = torch.from_numpy(next_token_embed[0])
+
+        #  For CFG
+        if cfg_weight > 0.0:
+            next_token_embed = torch.cat([next_token_embed, next_token_embed])
+
+        ## Update values for next generation loop
+        attention_mask = np.concatenate([attention_mask, np.ones((batch_size, 1), dtype=np.int64)], axis=1)
+        position_ids = position_ids[:, -1:] + 1
+        for j, key in enumerate(past_key_values):
+            past_key_values[key] = present_key_values[j]
+
+        inputs_embeds = next_token_embed.detach().numpy()
+
+        # Concatenate all predicted tokens along the sequence dimension.
+        predicted_tokens = torch.cat(generated_tokens, dim=1)  # shape: (B, num_tokens)
+
+        # Extract only the conditional batch.
+        speech_tokens = predicted_tokens[0]
+
+        speech_tokens = drop_invalid_tokens(speech_tokens)
+        speech_tokens = speech_tokens[speech_tokens < 6561]
+        speech_tokens = speech_tokens.unsqueeze(0)
+        speech_token_lens = torch.LongTensor([speech_tokens.size(1)])
+        prompt_token = ref_dict["prompt_token"]
+        speech_tokens, token_len = torch.concat([prompt_token, speech_tokens], dim=1), ref_dict["prompt_token_len"] + speech_token_lens
+    return speech_tokens, token_len
+
+speech_tokens, token_len = None, None
+if audio:
+    speech_tokens, token_len = execute_audio_to_audio_inference(audio, ref_dict)
+else:
+    speech_tokens, token_len = execute_text_to_audio_inference(text, ref_dict, conds)
+
 mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(speech_tokens)
 flow_infer_input = {
     "speech_tokens": speech_tokens.detach().numpy(),
     "token_len": token_len.detach().numpy(),
-    "mask": mask.detach().numpy()
+    "mask": mask.detach().numpy(),
+    "embedding": ref_dict["embedding"].detach().numpy(),
+    "prompt_feat": ref_dict["prompt_feat"].detach().numpy(),
 }
 mel_len1, mel_len2, mu, spks, cond = flow_inference_session.run(None, flow_infer_input)
 mu = np.ascontiguousarray(np.transpose(mu, (0, 2, 1)))
 
-#6. Conditional decoding
+## Conditional decoding
 total_len = torch.tensor([mel_len1 + mel_len2])
 mask = (~make_pad_mask(total_len)).squeeze(0).detach().numpy()
 rand_noise = torch.randn([1, 80, 50 * 300])
@@ -325,6 +351,7 @@ def _istft(magnitude, phase):
     inverse_transform = torch.istft(torch.complex(real, img), istft_params["n_fft"], istft_params["hop_len"],
                                     istft_params["n_fft"], window=stft_window.to(magnitude.device))
     return inverse_transform
+
 hift_generator_ort_input = {
     "speech_feat": output_mels,
     "output_sources": output_sources[0]

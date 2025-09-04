@@ -19,6 +19,11 @@ CFM_PARAMS = {
     "inference_cfg_rate": 0.7,
     "reg_loss_type": "l1"
 }
+S3GEN_SR = 24000
+S3_SR = 16_000
+
+# override certain torch functions
+torch.Tensor.item = lambda x: x # no-op
 
 def create_dummy_inputs(hp, batch_size=2, text_len=40):
     speaker_emb = torch.randn(batch_size, hp.speaker_embed_size)
@@ -146,7 +151,8 @@ class SpeechEncoder(nn.Module):
             self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
         cond_emb = self.conditional_encoding(t3_cond)
         text_emb = self.text_emb(text_tokens_ids)
-        text_emb[1].zero_() # CFG uncond
+        text_emb[1::2].zero_() # CFG uncond
+        # text_emb[1].zero_() # CFG uncond
         speech_emb = self.speech_emb(speech_input_ids)
         if self.hp.input_pos_emb == "learned":
             text_emb = text_emb + self.text_pos_emb(text_tokens_ids)
@@ -175,6 +181,8 @@ ort_speech_encoder_inputs = {
     "text_tokens_ids": text_tokens_ids.cpu().numpy(),
     "speech_input_ids": speech_input_ids.cpu().numpy()
 }
+for k, v in ort_speech_encoder_inputs.items():
+    print(f'{k=}, {v.shape=}')
 torch.onnx.export(
     embedder_model,
     (speaker_emb, cond_prompt_speech_tokens, emotion_adv, text_tokens_ids, speech_input_ids),
@@ -191,9 +199,11 @@ torch.onnx.export(
         "speech_input_ids": {0: "batch_size", 1: "seq_len_speech"},
         "inputs_embeds": {0: "batch_size", 1: "sequence_length"}
     },
+    # dynamo=True,
 )
 print(f"✅ Speech Encoder ONNX export is completed. Model saved as 'speech_encoder.onnx'")
 
+# input('wait...')
 batch_size, seq_len, _ = inputs_embeds.shape
 num_layers = 30
 num_key_value_heads = 16
@@ -249,40 +259,20 @@ torch.onnx.export(
 )
 print(f"✅ Speech embedding ONNX export is completed. Model saved as 'speech_embedding.onnx'")
 
-# 3. Export LLM (LLama) Backbone
-class LLamaWrapperWithPast(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = model.t3.tfmr
-        self.speech_head = model.t3.speech_head
-    
-    def forward(self, inputs_embeds, *past_key_values):
-        pkv_iter = iter(past_key_values)
-        pkv_tuples = tuple(
-            tuple(next(pkv_iter) for _ in range(2)) for _ in range(num_layers)
-        )
-        output = self.model(
-            inputs_embeds=inputs_embeds, 
-            past_key_values=pkv_tuples,
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True)
-        logits = self.speech_head(output.hidden_states[-1])
-        flat_pkv = [t for layer in output.past_key_values for t in layer]
-        return (logits, *flat_pkv)
+# 3. Export LLM Backbone (Llama3 from repo vladislavbro/llama_backbone_0.5) using https://github.com/microsoft/onnxruntime-genai/blob/main/src/python/py/models/builder.py
+# Before export, we replace embed_tokens nd lm_head of the LLM backbone model
+# because it does not specifically use LLM tokens
 
-llama_wrapper_with_past = LLamaWrapperWithPast()
-torch.onnx.export(
-    llama_wrapper_with_past,
-    onnx_inputs,
-    f"{output_dir}/llama_with_past.onnx",
-    export_params=True,
-    opset_version=14,
-    input_names=["inputs_embeds"] + pkv_input_names,
-    output_names=["logits"] + pkv_output_names,
-    dynamic_axes=dynamic_axes
-)
-print(f"✅ LLama wrapper with past ONNX export is completed. Model saved as 'llama_with_past.onnx'")
+# new_model = LlamaForCausalLM(config)
+# new_model.model.load_state_dict(model.t3.tfmr.state_dict(), strict=True)
+# new_model.config.vocab_size = model.t3.speech_head.out_features
+# new_model.vocab_size = new_model.config.vocab_size
+# new_model.model.embed_tokens = nn.Embedding(new_model.vocab_size, new_model.config.hidden_size)
+# new_model.model.embed_tokens.weight.data.copy_(model.t3.speech_head.weight.data)
+# new_model.lm_head = model.t3.speech_head
+# new_model.tie_weights()
+
+# new_model.push_to_hub("vladislavbro/llama_backbone_0.5", revision="refs/pr/1")
 
 hidden_states = torch.randn(1, text_tokens_ids.shape[1], config.n_channels)
 head_out = model.t3.speech_head(hidden_states)
@@ -293,6 +283,8 @@ speech_tokens = torch.randint(
 speech_token_lens = torch.LongTensor([speech_tokens.size(1)])
 speech_tokens, token_len = torch.concat([model.conds.gen["prompt_token"], speech_tokens], dim=1), model.conds.gen["prompt_token_len"] + speech_token_lens
 mask = ~make_pad_mask(token_len).unsqueeze(-1).to(speech_tokens)
+embedding = model.conds.gen["embedding"]
+prompt_feat = model.conds.gen["prompt_feat"]
 
 # 4. Export Flow inference wrapper
 class FlowInferenceWrapper(nn.Module):
@@ -303,13 +295,11 @@ class FlowInferenceWrapper(nn.Module):
         self.spk_embed_affine_layer = model.s3gen.flow.spk_embed_affine_layer
         self.encoder = model.s3gen.flow.encoder
         self.encoder_proj = model.s3gen.flow.encoder_proj
-        self.register_buffer('embedding', model.conds.gen['embedding'].detach())
-        self.register_buffer('prompt_feat', model.conds.gen['prompt_feat'].detach())
 
-    def forward(self, speech_tokens, token_len, mask):
+    def forward(self, speech_tokens, token_len, mask, embedding, prompt_feat):
 
         # xvec projection
-        embedding = F.normalize(self.embedding, dim=1)
+        embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
 
         # concat text and prompt_text
@@ -318,12 +308,12 @@ class FlowInferenceWrapper(nn.Module):
 
         # text encode
         text_encoded, _ = self.encoder(speech_tokens, token_len)
-        mel_len1, mel_len2 = self.prompt_feat.shape[1], text_encoded.shape[1] - self.prompt_feat.shape[1]
+        mel_len1, mel_len2 = prompt_feat.shape[1], text_encoded.shape[1] - prompt_feat.shape[1]
         text_encoded = self.encoder_proj(text_encoded)
 
         # get conditions
         conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size] ).to(text_encoded.dtype)
-        conds[:, :mel_len1] = self.prompt_feat
+        conds[:, :mel_len1] = prompt_feat
         conds = conds.transpose(1, 2)
 
         mu = text_encoded
@@ -334,17 +324,17 @@ class FlowInferenceWrapper(nn.Module):
 flow_inference = FlowInferenceWrapper()
 torch.onnx.export(
     flow_inference,
-    (speech_tokens, token_len, mask),
+    (speech_tokens, token_len, mask, embedding, embedding),
     f"{output_dir}/flow_inference.onnx",
     export_params=True,
     opset_version=14,
     do_constant_folding=True,
-    input_names=["speech_tokens", "token_len", "mask"],
+    input_names=["speech_tokens", "token_len", "mask", "embedding", "prompt_feat"],
     output_names=["mel_len1", "mel_len2", "mu", "spks", "cond"],
     dynamic_axes={
         "speech_tokens": {
             0: "batch_size",
-            1: "sequence_len"
+            1: "feature_dim"
         },
 
         "token_len": {
@@ -356,15 +346,26 @@ torch.onnx.export(
             1: "feature_dim",
             2: "time_steps" 
         },
+
+        "embedding": {
+            0: "batch_size", 
+            1: "feature_dim",
+        },
+
+        "prompt_feat": {
+            0: "batch_size", 
+            1: "feature_dim",
+        },
         
         "mu": {
             0: "batch_size", 
-            1: "feature_dim",
-            2: "time_steps" 
+            1: "time_steps",
+            2: "condition_dim" 
         },
         
         "spks": {
-            0: "batch_size"
+            0: "batch_size",
+            1: "condition_dim",
             # Note: speaker embeddings typically have fixed feature dimension
         },
         
@@ -507,12 +508,12 @@ torch.onnx.export(
     output_names=["dphi_dt"],
     dynamic_axes={
         'x_in': {0: 'batch_size', 2: 'input_time'},
-        'mask_in': {0: 'batch_size', 2: 'sequence_lenght'},
-        'mu_in': {0: 'batch_size', 2: 'sequence_lenght'},
+        'mask_in': {0: 'batch_size', 2: 'sequence_length'},
+        'mu_in': {0: 'batch_size', 2: 'sequence_length'},
         't_in': {0: 'batch_size'},
         'spks_in': {0: 'batch_size'},
-        "cond_in": {0: 'batch_size', 2: 'sequence_lenght'},
-        "dphi_dt": {0: "batch_size", 2: 'sequence_lenght'}
+        "cond_in": {0: 'batch_size', 2: 'sequence_length'},
+        "dphi_dt": {0: "batch_size", 2: 'sequence_length'}
     }
 )
 print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'conditional_decoder.onnx'")
