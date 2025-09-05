@@ -7,6 +7,9 @@ from chatterbox.tts import ChatterboxTTS, T3Cond
 import onnxslim
 import os
 from einops import pack, rearrange, repeat
+import torchaudio as ta
+from librosa.filters import mel as librosa_mel_fn
+import torchaudio.compliance.kaldi as Kaldi
 
 SPEECH_VOCAB_SIZE = 6561
 SOS = SPEECH_VOCAB_SIZE
@@ -75,6 +78,50 @@ def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     mask = mask.to(dtype)
     mask = (1.0 - mask) * -1.0e+10
     return mask
+
+def pad_list(xs, pad_value):
+    """Perform padding for the list of tensors.
+
+    Args:
+        xs (List): List of Tensors [(T_1, `*`), (T_2, `*`), ..., (T_B, `*`)].
+        pad_value (float): Value for padding.
+
+    Returns:
+        Tensor: Padded tensor (B, Tmax, `*`).
+
+    Examples:
+        >>> x = [torch.ones(4), torch.ones(2), torch.ones(1)]
+        >>> x
+        [tensor([1., 1., 1., 1.]), tensor([1., 1.]), tensor([1.])]
+        >>> pad_list(x, 0)
+        tensor([[1., 1., 1., 1.],
+                [1., 1., 0., 0.],
+                [1., 0., 0., 0.]])
+
+    """
+    n_batch = len(xs)
+    max_len = max(x.size(0) for x in xs)
+    pad = xs[0].new(n_batch, max_len, *xs[0].size()[1:]).fill_(pad_value)
+
+    for i in range(n_batch):
+        pad[i, : xs[i].size(0)] = xs[i]
+
+    return pad
+
+def extract_feature(audio):
+    features = []
+    feature_times = []
+    feature_lengths = []
+    for au in audio:
+        feature = Kaldi.fbank(au.unsqueeze(0), num_mel_bins=80)
+        feature = feature - feature.mean(dim=0, keepdim=True)
+        features.append(feature)
+        feature_times.append(au.shape[0])
+        feature_lengths.append(feature.shape[0])
+    # padding for batch inference
+    features_padded = pad_list(features, pad_value=0)
+    return features_padded, feature_lengths, feature_times
+
 
 model = ChatterboxTTS.from_pretrained(device="cpu")
 config = model.t3.hp
@@ -203,6 +250,94 @@ torch.onnx.export(
 )
 print(f"✅ Speech Encoder ONNX export is completed. Model saved as 'speech_encoder.onnx'")
 
+ref_wav = torch.empty((1, 1000)).uniform_(-0.97619647, 0.93708616)
+resampler = ta.transforms.Resample(S3GEN_SR, S3_SR)
+# Tokenize 16khz reference
+tokenizer = model.s3gen.tokenizer
+# Resample to 16kHz
+ref_wav_16 = resampler(ref_wav)
+ref_speech_tokens, ref_speech_token_lens = tokenizer(ref_wav_16)
+ref_wav_16, _, _ = extract_feature(ref_wav_16)
+
+# 2. Export embedding reference wrapper
+class EmbeddingReferenceWrapper(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.speaker_encoder = model.s3gen.speaker_encoder
+    
+    def mel_spectrogram(self, y, n_fft=1920, num_mels=80, sampling_rate=24000, hop_size=480, win_size=1920,
+                    fmin=0, fmax=8000, center=False):
+        """Copied from https://github.com/shivammehta25/Matcha-TTS/blob/main/matcha/utils/audio.py
+        Set default values according to Cosyvoice's config.
+        """
+
+        if len(y.shape) == 1:
+            y = y[None, ]
+
+        y = torch.nn.functional.pad(
+            y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
+        )
+        y = y.squeeze(1)
+        hann_window = torch.hann_window(1920)
+        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+        mel = torch.from_numpy(mel).float()
+        spec = torch.stft(
+            y,
+            n_fft,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=hann_window,
+            center=center,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+            return_complex=False,
+        )
+        real = spec[..., 0]
+        imag = spec[..., 1]
+        spec = torch.sqrt(real**2 + imag**2 + 1e-9)
+        spec = torch.matmul(mel, spec)
+        spec = torch.log(torch.clamp(spec, min=1e-5) * 1)
+
+        return spec
+
+    def forward(self, ref_wav, ref_wav_16, ref_speech_tokens, ref_speech_token_lens):
+        ref_wav_24 = ref_wav
+        ref_mels_24 = self.mel_spectrogram(ref_wav_24).transpose(1, 2)
+
+        # Speaker embedding
+        ref_x_vector = self.speaker_encoder(ref_wav_16)
+
+        # Make sure mel_len = 2 * stoken_len (happens when the input is not padded to multiple of 40ms)
+        if ref_mels_24.shape[1] != 2 * ref_speech_tokens.shape[1]:
+            ref_speech_tokens = ref_speech_tokens[:, :ref_mels_24.shape[1] // 2]
+            ref_speech_token_lens[0] = ref_speech_tokens.shape[1]
+
+        prompt_token=ref_speech_tokens,
+        prompt_token_len=ref_speech_token_lens,
+        prompt_feat=ref_mels_24,
+        embedding=ref_x_vector,
+        return prompt_token, prompt_token_len, prompt_feat, embedding
+
+embeddig_ref_wrapper = EmbeddingReferenceWrapper()
+torch.onnx.export(
+    embeddig_ref_wrapper,
+    (ref_wav, ref_wav_16, ref_speech_tokens, ref_speech_token_lens),
+    f"{output_dir}/embedding_ref.onnx",
+    export_params=True,
+    opset_version=17,
+    input_names=["ref_wav", "ref_wav_16", "ref_speech_tokens", "ref_speech_token_lens"],
+    output_names=["prompt_token", "prompt_token_len", "prompt_feat", "embedding"],
+    dynamic_axes={
+        "ref_wav": {1: "sequence_length"},
+        "ref_wav_16": {1: "sequence_length"},
+        "embedding": {1: "embedding_length"},
+        "ref_speech_tokens": {1: "sequence_length"},
+        "prompt_feat": {1: "feat_length"},
+    },
+)
+print(f"✅ Embedding reference ONNX export is completed. Model saved as 'embedding_ref.onnx'")
+
 # input('wait...')
 batch_size, seq_len, _ = inputs_embeds.shape
 num_layers = 30
@@ -232,7 +367,7 @@ onnx_inputs = (inputs_embeds, *dummy_past_key_values_kwargs.values())
 next_token = torch.full((batch_size, 1), 6563, dtype=torch.long)
 idx = torch.tensor([0])
 
-# 2. Export speech embedding
+# 3. Export speech embedding
 class SpeechEmbedding(nn.Module):
     def __init__(self):
         super().__init__()
@@ -259,7 +394,7 @@ torch.onnx.export(
 )
 print(f"✅ Speech embedding ONNX export is completed. Model saved as 'speech_embedding.onnx'")
 
-# 3. Export LLM Backbone (Llama3 from repo vladislavbro/llama_backbone_0.5) using https://github.com/microsoft/onnxruntime-genai/blob/main/src/python/py/models/builder.py
+# 4. Export LLM Backbone (Llama3 from repo vladislavbro/llama_backbone_0.5) using https://github.com/microsoft/onnxruntime-genai/blob/main/src/python/py/models/builder.py
 # Before export, we replace embed_tokens nd lm_head of the LLM backbone model
 # because it does not specifically use LLM tokens
 
@@ -286,7 +421,7 @@ mask = ~make_pad_mask(token_len).unsqueeze(-1).to(speech_tokens)
 embedding = model.conds.gen["embedding"]
 prompt_feat = model.conds.gen["prompt_feat"]
 
-# 4. Export Flow inference wrapper
+# 5. Export Flow inference wrapper
 class FlowInferenceWrapper(nn.Module):
     def __init__(self):
         super().__init__()
@@ -378,7 +513,7 @@ torch.onnx.export(
 )
 print(f"✅ Flow inference ONNX export is completed. Model saved as 'flow_inference.onnx'")
 
-#5. Export Conditional Decoder
+#6. Export Conditional Decoder
 class ConditionalDecoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -520,7 +655,7 @@ print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'condit
 
 speech_feat = cond_decoder(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
 
-#6. Export STFTWrapper
+#7. Export STFTWrapper
 class STFTWrapper(nn.Module):
     def __init__(self):
         super().__init__()
@@ -565,7 +700,7 @@ torch.onnx.export(
 )
 print(f"✅ STFTWrapper ONNX export is completed. Model saved as 'stft_wrapper.onnx'")
 
-#7. Export HiFTGenerator
+#8. Export HiFTGenerator
 class HiFTGenerator(nn.Module):
     def __init__(self):
         super().__init__()
@@ -631,7 +766,7 @@ torch.onnx.export(
 )
 print(f"✅ HiFTGenerator ONNX export is completed. Model saved as 'hift_generator.onnx'")
 
-#8. Post-processing
+#9. Post-processing
 for f in os.listdir(output_dir):
     p = os.path.join(output_dir, f)
     onnxslim.slim(p, p)
