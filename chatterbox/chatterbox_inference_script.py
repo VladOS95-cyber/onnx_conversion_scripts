@@ -2,7 +2,6 @@ import onnxruntime
 import numpy as np
 from huggingface_hub import hf_hub_download
 from chatterbox.tts import Conditionals
-from chatterbox.vc import ChatterboxVC
 from chatterbox.models.s3tokenizer import S3Tokenizer
 import torchaudio as ta
 from tokenizers import Tokenizer
@@ -154,7 +153,6 @@ flow_inference_session = onnxruntime.InferenceSession(flow_inference_path)
 stft_wrapper_session = onnxruntime.InferenceSession(stft_wrapper_path)
 hift_generator_session = onnxruntime.InferenceSession(hift_generator_path)
 cond_decoder_session = onnxruntime.InferenceSession(conditional_decoder_path)
-model = ChatterboxVC.from_pretrained(device="cpu")
 
 def set_target_voice(wav_fpath):
     embedding_ref_path = hf_hub_download(repo_id=model_id, filename="embedding_ref.onnx", local_dir=output_dir)
@@ -174,7 +172,6 @@ def set_target_voice(wav_fpath):
         "ref_speech_token_lens": ref_speech_token_lens.detach().numpy()
     }
     prompt_token, prompt_token_len, prompt_feat, embedding = embed_ref_session.run(None, ort_embed_ref_input)
-    # ref_dict = model.s3gen.embed_ref(s3gen_ref_wav)
     ref_dict = {
         "prompt_token": prompt_token,
         "prompt_token_len": prompt_token_len,
