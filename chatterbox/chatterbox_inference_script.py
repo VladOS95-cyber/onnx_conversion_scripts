@@ -2,7 +2,6 @@ import onnxruntime
 import numpy as np
 from huggingface_hub import hf_hub_download
 from chatterbox.tts import Conditionals
-from chatterbox.models.s3tokenizer import S3Tokenizer
 import torchaudio as ta
 from tokenizers import Tokenizer
 import torch
@@ -12,7 +11,6 @@ from tqdm import tqdm
 from scipy.signal import get_window
 import perth
 import librosa
-import torchaudio.compliance.kaldi as Kaldi
 
 SPACE = "[SPACE]"
 SPEECH_VOCAB_SIZE = 6561
@@ -102,34 +100,24 @@ def pad_list(xs, pad_value):
 
     """
     n_batch = len(xs)
-    max_len = max(x.size(0) for x in xs)
-    pad = xs[0].new(n_batch, max_len, *xs[0].size()[1:]).fill_(pad_value)
+    max_len = max(x.shape[0] for x in xs)
 
-    for i in range(n_batch):
-        pad[i, : xs[i].size(0)] = xs[i]
+    # shape = (B, Tmax, *) using the first tensor’s remaining dimensions
+    out_shape = (n_batch, max_len) + xs[0].shape[1:]
+    pad = np.full(out_shape, pad_value, dtype=xs[0].dtype)
+
+    for i, x in enumerate(xs):
+        length = x.shape[0]
+        pad[i, :length, ...] = x
 
     return pad
-
-def extract_feature(audio):
-    features = []
-    feature_times = []
-    feature_lengths = []
-    for au in audio:
-        feature = Kaldi.fbank(au.unsqueeze(0), num_mel_bins=80)
-        feature = feature - feature.mean(dim=0, keepdim=True)
-        features.append(feature)
-        feature_times.append(au.shape[0])
-        feature_lengths.append(feature.shape[0])
-    # padding for batch inference
-    features_padded = pad_list(features, pad_value=0)
-    return features_padded, feature_lengths, feature_times
 
 output_dir = "converted"
 output_file_name = "infer_output.wav"
 model_id = "onnx-community/chatterbox-onnx"
 text = "The Lord of the Rings is the greatest work of literature."
 audio = None
-target_voice_path = None
+target_voice_path = "back_4_more_fun.wav"
 
 ## Load model
 speech_encoder_path = hf_hub_download(repo_id=model_id, filename="speech_encoder.onnx", local_dir=output_dir)
@@ -140,42 +128,50 @@ conditional_decoder_path = hf_hub_download(repo_id=model_id, filename="condition
 flow_inference_path = hf_hub_download(repo_id=model_id, filename="flow_inference.onnx", local_dir=output_dir)
 stft_wrapper_path = hf_hub_download(repo_id=model_id, filename="stft_wrapper.onnx", local_dir=output_dir)
 hift_generator_path = hf_hub_download(repo_id=model_id, filename="hift_generator.onnx", local_dir=output_dir)
+tokenizer_path = hf_hub_download(repo_id=model_id, filename="speech_tokenizer_v2.onnx", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="tokenizer.json", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="conds.pt", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="tokenizer.json", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="vc_tokenizer_weights.pth", local_dir=output_dir)
 conds = Conditionals.load("converted/conds.pt")
-tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
-tokenizer.load_state_dict(torch.load("vc_tokenizer_weights.pth"))
 
 ## Start common inferense sessions
+tokenizer_session = onnxruntime.InferenceSession(tokenizer_path)
 flow_inference_session = onnxruntime.InferenceSession(flow_inference_path)
 stft_wrapper_session = onnxruntime.InferenceSession(stft_wrapper_path)
 hift_generator_session = onnxruntime.InferenceSession(hift_generator_path)
 cond_decoder_session = onnxruntime.InferenceSession(conditional_decoder_path)
 
 def set_target_voice(wav_fpath):
-    embedding_ref_path = hf_hub_download(repo_id=model_id, filename="embedding_ref.onnx", local_dir=output_dir)
-    embed_ref_session = onnxruntime.InferenceSession(embedding_ref_path)
+    feature_extractor_path = hf_hub_download(repo_id=model_id, filename="feature_extractor.onnx", local_dir=output_dir)
+    speaker_emb_path = hf_hub_download(repo_id=model_id, filename="speaker_emb.onnx", local_dir=output_dir)
+    feature_extractor_session = onnxruntime.InferenceSession(feature_extractor_path)
+    speaker_encoder_session = onnxruntime.InferenceSession(speaker_emb_path)
     s3gen_ref_wav, _ = librosa.load(wav_fpath, sr=S3GEN_SR)
     s3gen_ref_wav = s3gen_ref_wav[:DEC_COND_LEN]
     if len(s3gen_ref_wav.shape) == 1: 
         s3gen_ref_wav = np.expand_dims(s3gen_ref_wav, axis=0)
-    resampler = ta.transforms.Resample(S3GEN_SR, S3_SR) 
-    ref_wav_16 = resampler(torch.from_numpy(s3gen_ref_wav))
-    ref_speech_tokens, ref_speech_token_lens = tokenizer(ref_wav_16)
-    ref_wav_16, _, _ = extract_feature(ref_wav_16)
-    ort_embed_ref_input = {
-        "ref_wav": s3gen_ref_wav,
-        "ref_wav_16": ref_wav_16.detach().numpy(),
-        "ref_speech_tokens": ref_speech_tokens.detach().numpy(),
-        "ref_speech_token_lens": ref_speech_token_lens.detach().numpy()
+    feature_ort_input = {
+        "ref_wav": s3gen_ref_wav
     }
-    prompt_token, prompt_token_len, prompt_feat, embedding = embed_ref_session.run(None, ort_embed_ref_input)
+    feature, ref_mels_24, ref_wav_16 = feature_extractor_session.run(None, feature_ort_input)
+    padded_feature = pad_list([feature], 0)
+    speaker_enc_input = {
+        "feature": padded_feature
+    }
+    embedding = speaker_encoder_session.run(None, speaker_enc_input)[0]
+    feats_length = np.array([ref_wav_16.shape[-1]], dtype=np.int32)
+    prompt_token_len = (feats_length + 2 - 1 * (3 - 1) - 1) // 2 + 1
+    prompt_token_len = (prompt_token_len + 2 - 1 * (3 - 1) - 1) // 2 + 1
+    ort_tokenizer_input = {
+        "feats": ref_wav_16,
+        "feats_length": feats_length
+    }
+    ref_speech_tokens = tokenizer_session.run(None, ort_tokenizer_input)[0]
     ref_dict = {
-        "prompt_token": prompt_token,
+        "prompt_token": ref_speech_tokens,
         "prompt_token_len": prompt_token_len,
-        "prompt_feat": prompt_feat,
+        "prompt_feat": ref_mels_24,
         "embedding" : embedding
     }
     return ref_dict
@@ -188,16 +184,16 @@ def set_ref_dict(target_voice_path=None):
 
 ref_dict = set_ref_dict(target_voice_path)
 
-def execute_audio_to_audio_inference(audio, ref_dict):
-    print("Start Audio to Audio inference script...")
-    ## Prepare input
-    audio_16, _ = librosa.load(audio, sr=S3_SR)
-    audio_16 = torch.from_numpy(audio_16).float()[None, ]
-    speech_tokens, _ = tokenizer(audio_16)
-    speech_token_lens = np.array(speech_tokens.size(1))
-    prompt_token = ref_dict["prompt_token"]
-    speech_tokens, token_len = np.concatenate([prompt_token, speech_tokens], axis=1), ref_dict["prompt_token_len"] + speech_token_lens
-    return speech_tokens, token_len
+# def execute_audio_to_audio_inference(audio, ref_dict):
+#     print("Start Audio to Audio inference script...")
+#     ## Prepare input
+#     audio_16, _ = librosa.load(audio, sr=S3_SR)
+#     audio_16 = torch.from_numpy(audio_16).float()[None, ]
+#     speech_tokens, _ = tokenizer(audio_16)
+#     speech_token_lens = np.array(speech_tokens.size(1))
+#     prompt_token = ref_dict["prompt_token"]
+#     speech_tokens, token_len = np.concatenate([prompt_token, speech_tokens], axis=1), ref_dict["prompt_token_len"] + speech_token_lens
+#     return speech_tokens, token_len
 
 def execute_text_to_audio_inference(text, ref_dict, conds):
     print("Start Text to Audio inference script...")
@@ -333,10 +329,10 @@ def execute_text_to_audio_inference(text, ref_dict, conds):
     return speech_tokens, token_len
 
 speech_tokens, token_len = None, None
-if audio:
-    speech_tokens, token_len = execute_audio_to_audio_inference(audio, ref_dict)
-else:
-    speech_tokens, token_len = execute_text_to_audio_inference(text, ref_dict, conds)
+# if audio:
+#     speech_tokens, token_len = execute_audio_to_audio_inference(audio, ref_dict)
+# else:
+speech_tokens, token_len = execute_text_to_audio_inference(text, ref_dict, conds)
 
 mask = (~make_pad_mask(torch.from_numpy(token_len))).unsqueeze(-1)
 flow_infer_input = {

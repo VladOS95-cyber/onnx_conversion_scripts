@@ -9,8 +9,12 @@ import os
 from einops import pack, rearrange, repeat
 import torchaudio as ta
 from librosa.filters import mel as librosa_mel_fn
-import torchaudio.compliance.kaldi as Kaldi
+from torchaudio.compliance.kaldi import get_mel_banks
+from typing import Tuple
+import math
+import librosa
 
+MILLISECONDS_TO_SECONDS = 0.001
 SPEECH_VOCAB_SIZE = 6561
 SOS = SPEECH_VOCAB_SIZE
 EOS = SPEECH_VOCAB_SIZE + 1
@@ -24,6 +28,7 @@ CFM_PARAMS = {
 }
 S3GEN_SR = 24000
 S3_SR = 16_000
+S3_HOP = 160  # 100 frames/sec
 
 # override certain torch functions
 torch.Tensor.item = lambda x: x # no-op
@@ -108,20 +113,6 @@ def pad_list(xs, pad_value):
 
     return pad
 
-def extract_feature(audio):
-    features = []
-    feature_times = []
-    feature_lengths = []
-    for au in audio:
-        feature = Kaldi.fbank(au.unsqueeze(0), num_mel_bins=80)
-        feature = feature - feature.mean(dim=0, keepdim=True)
-        features.append(feature)
-        feature_times.append(au.shape[0])
-        feature_lengths.append(feature.shape[0])
-    # padding for batch inference
-    features_padded = pad_list(features, pad_value=0)
-    return features_padded, feature_lengths, feature_times
-
 
 model = ChatterboxTTS.from_pretrained(device="cpu")
 config = model.t3.hp
@@ -199,7 +190,6 @@ class SpeechEncoder(nn.Module):
         cond_emb = self.conditional_encoding(t3_cond)
         text_emb = self.text_emb(text_tokens_ids)
         text_emb[1::2].zero_() # CFG uncond
-        # text_emb[1].zero_() # CFG uncond
         speech_emb = self.speech_emb(speech_input_ids)
         if self.hp.input_pos_emb == "learned":
             text_emb = text_emb + self.text_pos_emb(text_tokens_ids)
@@ -251,29 +241,34 @@ torch.onnx.export(
 print(f"✅ Speech Encoder ONNX export is completed. Model saved as 'speech_encoder.onnx'")
 
 ref_wav = torch.empty((1, 1000)).uniform_(-0.97619647, 0.93708616)
-resampler = ta.transforms.Resample(S3GEN_SR, S3_SR)
-# Tokenize 16khz reference
-tokenizer = model.s3gen.tokenizer
-# Resample to 16kHz
-ref_wav_16 = resampler(ref_wav)
-ref_speech_tokens, ref_speech_token_lens = tokenizer(ref_wav_16)
-ref_wav_16, _, _ = extract_feature(ref_wav_16)
 
-# 2. Export embedding reference wrapper
-class EmbeddingReferenceWrapper(nn.Module):
+# 2. Export Feature Extractor
+class FeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
-        self.speaker_encoder = model.s3gen.speaker_encoder
+        self.resampler = ta.transforms.Resample(S3GEN_SR, S3_SR)
+        self.eps = torch.tensor(torch.finfo(torch.float).eps)
+        self.n_fft = 400
+        _mel_filters = librosa.filters.mel(
+            sr=S3_SR,
+            n_fft=self.n_fft,
+            n_mels=128
+        )
+        self.register_buffer(
+            "mel_filters",
+            torch.FloatTensor(_mel_filters),
+        )
+
+        self.register_buffer(
+            "window",
+            torch.hann_window(self.n_fft),
+        )
     
     def mel_spectrogram(self, y, n_fft=1920, num_mels=80, sampling_rate=24000, hop_size=480, win_size=1920,
                     fmin=0, fmax=8000, center=False):
         """Copied from https://github.com/shivammehta25/Matcha-TTS/blob/main/matcha/utils/audio.py
         Set default values according to Cosyvoice's config.
         """
-
-        if len(y.shape) == 1:
-            y = y[None, ]
-
         y = torch.nn.functional.pad(
             y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
         )
@@ -300,43 +295,251 @@ class EmbeddingReferenceWrapper(nn.Module):
         spec = torch.log(torch.clamp(spec, min=1e-5) * 1)
 
         return spec
+    
+    def _next_power_of_2(self, x: int) -> int:
+        r"""Returns the smallest power of 2 that is greater than x"""
+        return 1 if x == 0 else 2 ** (x - 1).bit_length()
+    
+    def _get_strided(self, waveform: torch.Tensor, window_size: int, window_shift: int) -> torch.Tensor:
+        r"""Given a waveform (1D tensor of size ``num_samples``), it returns a 2D tensor (m, ``window_size``)
+        representing how the window is shifted along the waveform. Each row is a frame.
 
-    def forward(self, ref_wav, ref_wav_16, ref_speech_tokens, ref_speech_token_lens):
+        Args:
+            waveform (Tensor): Tensor of size ``num_samples``
+            window_size (int): Frame length
+            window_shift (int): Frame shift
+            snip_edges (bool): If True, end effects will be handled by outputting only frames that completely fit
+                in the file, and the number of frames depends on the frame_length.  If False, the number of frames
+                depends only on the frame_shift, and we reflect the data at the ends.
+
+        Returns:
+            Tensor: 2D tensor of size (m, ``window_size``) where each row is a frame
+        """
+        num_samples = waveform.size(0)
+        strides = (window_shift * waveform.stride(0), waveform.stride(0))
+
+        if num_samples < window_size:
+            return torch.empty((0, 0), dtype=waveform.dtype, device=waveform.device)
+        else:
+            m = 1 + (num_samples - window_size) // window_shift
+
+        sizes = (m, window_size)
+        return waveform.as_strided(sizes, strides)
+
+    def _get_log_energy(self, strided_input: torch.Tensor, epsilon: torch.Tensor, energy_floor: float) -> torch.Tensor:
+        r"""Returns the log energy of size (m) for a strided_input (m,*)"""
+        device, dtype = strided_input.device, strided_input.dtype
+        log_energy = torch.max(strided_input.pow(2).sum(1), epsilon).log()  # size (m)
+        if energy_floor == 0.0:
+            return log_energy
+        return torch.max(log_energy, torch.tensor(math.log(energy_floor), device=device, dtype=dtype))
+
+    def _get_window(
+        self,
+        waveform: torch.Tensor,
+        padded_window_size: int,
+        window_size: int,
+        window_shift: int,
+        preemphasis_coefficient: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Gets a window and its log energy
+
+        Returns:
+            (Tensor, Tensor): strided_input of size (m, ``padded_window_size``) and signal_log_energy of size (m)
+        """
+        device, dtype = waveform.device, waveform.dtype
+        # size (m, window_size)
+        strided_input = self._get_strided(waveform, window_size, window_shift)
+
+        # Subtract each row/frame by its mean
+        row_means = torch.mean(strided_input, dim=1).unsqueeze(1)  # size (m, 1)
+        strided_input = strided_input - row_means
+
+        if preemphasis_coefficient != 0.0:
+            # strided_input[i,j] -= preemphasis_coefficient * strided_input[i, max(0, j-1)] for all i,j
+            offset_strided_input = torch.nn.functional.pad(strided_input.unsqueeze(0), (1, 0), mode="replicate").squeeze(
+                0
+            )  # size (m, window_size + 1)
+            strided_input = strided_input - preemphasis_coefficient * offset_strided_input[:, :-1]
+
+        # Apply window_function to each row/frame
+        window_function = torch.hann_window(window_size, periodic=False, device=device, dtype=dtype).pow(0.85).unsqueeze(0)  # size (1, window_size)
+        strided_input = strided_input * window_function  # size (m, window_size)
+
+        # Pad columns with zero until we reach size (m, padded_window_size)
+        if padded_window_size != window_size:
+            padding_right = padded_window_size - window_size
+            strided_input = torch.nn.functional.pad(
+                strided_input.unsqueeze(0), (0, padding_right), mode="constant", value=0
+            ).squeeze(0)
+
+        return strided_input
+
+    def _get_waveform_and_window_properties(
+        self,
+        waveform: torch.Tensor,
+        channel: int,
+        sample_frequency: float,
+        frame_shift: float,
+        frame_length: float,
+    ) -> Tuple[torch.Tensor, int, int, int]:
+        r"""Gets the waveform and window properties"""
+        channel = max(channel, 0)
+        waveform = waveform[channel, :]  # size (n)
+        window_shift = int(sample_frequency * frame_shift * MILLISECONDS_TO_SECONDS)
+        window_size = int(sample_frequency * frame_length * MILLISECONDS_TO_SECONDS)
+        padded_window_size = self._next_power_of_2(window_size)
+        return waveform, window_shift, window_size, padded_window_size
+
+    def extract_feature(self, waveform: torch.Tensor,
+        channel: int = -1,
+        frame_length: float = 25.0,
+        frame_shift: float = 10.0,
+        high_freq: float = 0.0,
+        low_freq: float = 20.0,
+        num_mel_bins: int = 23,
+        preemphasis_coefficient: float = 0.97,
+        sample_frequency: float = 16000.0,
+        vtln_high: float = -500.0,
+        vtln_low: float = 100.0,
+        vtln_warp: float = 1.0):
+
+        device, dtype = waveform.device, waveform.dtype
+        waveform, window_shift, window_size, padded_window_size = self._get_waveform_and_window_properties(
+        waveform, channel, sample_frequency, frame_shift, frame_length)
+
+        # strided_input, size (m, padded_window_size) and signal_log_energy, size (m)
+        strided_input = self._get_window(
+            waveform,
+            padded_window_size,
+            window_size,
+            window_shift,
+            preemphasis_coefficient,
+        )
+
+        # size (m, padded_window_size // 2 + 1)
+        spec = torch.stft(
+            strided_input,
+            n_fft=512,
+            hop_length=512,
+            center=False,
+            window=None,
+            return_complex=False
+        )   # shape: [..., freq, 2]  (last dim = [real, imag])
+
+        # Compute magnitude manually
+        real = spec[..., 0]
+        imag = spec[..., 1]
+        spectrum = torch.sqrt(real**2 + imag**2).squeeze(-1)
+        spectrum = spectrum.pow(2.0)
+
+        # size (num_mel_bins, padded_window_size // 2)
+        mel_energies, _ = get_mel_banks(
+            num_mel_bins, padded_window_size, sample_frequency, low_freq, high_freq, vtln_low, vtln_high, vtln_warp
+        )
+        mel_energies = mel_energies.to(device=device, dtype=dtype)
+
+        # pad right column with zeros and add dimension, size (num_mel_bins, padded_window_size // 2 + 1)
+        mel_energies = torch.nn.functional.pad(mel_energies, (0, 1), mode="constant", value=0)
+
+        # sum with mel fiterbanks over the power spectrum, size (m, num_mel_bins)
+        mel_energies = torch.matmul(spectrum, mel_energies.T)
+
+        # avoid log of zero (which should be prevented anyway by dithering)
+        mel_energies = torch.max(mel_energies, self.eps).log()
+        return mel_energies
+
+    def log_mel_spectrogram(
+        self,
+        audio: torch.Tensor
+    ):
+        """
+        Compute the log-Mel spectrogram of
+
+        Parameters
+        ----------
+        audio: torch.Tensor, shape = (*)
+            The path to audio or either a NumPy array or Tensor containing the
+            audio waveform in 16 kHz
+
+        padding: int
+            Number of zero samples to pad to the right
+
+        Returns
+        -------
+        torch.Tensor, shape = (128, n_frames)
+            A Tensor that contains the Mel spectrogram
+        """
+        stft = torch.stft(
+            audio, self.n_fft, S3_HOP,
+            window=self.window,
+            return_complex=False
+        )
+        real = stft[..., 0]
+        imag = stft[..., 1]
+        magnitudes = real.pow(2) + imag.pow(2)
+
+        mel_spec = self.mel_filters @ magnitudes
+
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        return log_spec
+
+    def forward(self, ref_wav):
         ref_wav_24 = ref_wav
         ref_mels_24 = self.mel_spectrogram(ref_wav_24).transpose(1, 2)
+        ref_wav_16 = self.resampler(ref_wav)
+        feature = self.extract_feature(ref_wav_16, num_mel_bins=80)
+        feature = feature - feature.mean(dim=0, keepdim=True)
+        ref_wav_16 = self.log_mel_spectrogram(ref_wav_16)
+        return feature, ref_mels_24, ref_wav_16
 
-        # Speaker embedding
-        ref_x_vector = self.speaker_encoder(ref_wav_16)
-
-        # Make sure mel_len = 2 * stoken_len (happens when the input is not padded to multiple of 40ms)
-        if ref_mels_24.shape[1] != 2 * ref_speech_tokens.shape[1]:
-            ref_speech_tokens = ref_speech_tokens[:, :ref_mels_24.shape[1] // 2]
-            ref_speech_token_lens[0] = ref_speech_tokens.shape[1]
-
-        prompt_token=ref_speech_tokens,
-        prompt_token_len=ref_speech_token_lens,
-        prompt_feat=ref_mels_24,
-        embedding=ref_x_vector,
-        return prompt_token, prompt_token_len, prompt_feat, embedding
-
-embeddig_ref_wrapper = EmbeddingReferenceWrapper()
+feature_extractor = FeatureExtractor()
+feature, ref_mels_24, ref_wav_16 = feature_extractor(ref_wav)
 torch.onnx.export(
-    embeddig_ref_wrapper,
-    (ref_wav, ref_wav_16, ref_speech_tokens, ref_speech_token_lens),
-    f"{output_dir}/embedding_ref.onnx",
+    feature_extractor,
+    (ref_wav),
+    f"{output_dir}/feature_extractor.onnx",
     export_params=True,
     opset_version=17,
-    input_names=["ref_wav", "ref_wav_16", "ref_speech_tokens", "ref_speech_token_lens"],
-    output_names=["prompt_token", "prompt_token_len", "prompt_feat", "embedding"],
+    input_names=["ref_wav"],
+    output_names=["feature", "ref_mels_24", "ref_wav_16"],
     dynamic_axes={
         "ref_wav": {1: "sequence_length"},
-        "ref_wav_16": {1: "sequence_length"},
-        "embedding": {1: "embedding_length"},
-        "ref_speech_tokens": {1: "sequence_length"},
-        "prompt_feat": {1: "feat_length"},
+        "feature": {0: "batch_size", 1: "feature_dim"},
+        "ref_mels_24": {0: "batch_size", 1: "time", 2: "feature_dim"},
+        "ref_mels_16": {0: "batch_size", 1: "number_of_mels", 2: "number_of_frames"},
     },
 )
-print(f"✅ Embedding reference ONNX export is completed. Model saved as 'embedding_ref.onnx'")
+print(f"✅ Feature Extractor ONNX export is completed. Model saved as 'feature_extractor.onnx'")
+
+#3. Export speech encoder
+class SpeakerEncoderWrapper(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.speaker_encoder = model.s3gen.speaker_encoder
+    
+    def forward(self, feature):
+        embedding = self.speaker_encoder(feature)
+        return embedding
+
+padded_feature = pad_list([feature], 0)
+speaker_embd_wrapper = SpeakerEncoderWrapper()
+torch.onnx.export(
+    speaker_embd_wrapper,
+    (padded_feature),
+    f"{output_dir}/speaker_emb.onnx",
+    export_params=True,
+    opset_version=14,
+    input_names=["feature"],
+    output_names=["embedding"],
+    dynamic_axes={
+        "feature": {0: "batch_size", 0: "embedding_size", 1: "feature_dim"},
+        "embedding": {1: "embedding_length"},
+    },
+)
+print(f"✅ Speaker embedding reference ONNX export is completed. Model saved as 'speaker_emb.onnx'")
 
 # input('wait...')
 batch_size, seq_len, _ = inputs_embeds.shape
@@ -367,7 +570,7 @@ onnx_inputs = (inputs_embeds, *dummy_past_key_values_kwargs.values())
 next_token = torch.full((batch_size, 1), 6563, dtype=torch.long)
 idx = torch.tensor([0])
 
-# 3. Export speech embedding
+# 4. Export speech embedding
 class SpeechEmbedding(nn.Module):
     def __init__(self):
         super().__init__()
@@ -394,7 +597,7 @@ torch.onnx.export(
 )
 print(f"✅ Speech embedding ONNX export is completed. Model saved as 'speech_embedding.onnx'")
 
-# 4. Export LLM Backbone (Llama3 from repo vladislavbro/llama_backbone_0.5) using https://github.com/microsoft/onnxruntime-genai/blob/main/src/python/py/models/builder.py
+# 5. Export LLM Backbone (Llama3 from repo vladislavbro/llama_backbone_0.5) using https://github.com/microsoft/onnxruntime-genai/blob/main/src/python/py/models/builder.py
 # Before export, we replace embed_tokens nd lm_head of the LLM backbone model
 # because it does not specifically use LLM tokens
 
@@ -421,7 +624,7 @@ mask = ~make_pad_mask(token_len).unsqueeze(-1).to(speech_tokens)
 embedding = model.conds.gen["embedding"]
 prompt_feat = model.conds.gen["prompt_feat"]
 
-# 5. Export Flow inference wrapper
+# 6. Export Flow inference wrapper
 class FlowInferenceWrapper(nn.Module):
     def __init__(self):
         super().__init__()
@@ -513,7 +716,7 @@ torch.onnx.export(
 )
 print(f"✅ Flow inference ONNX export is completed. Model saved as 'flow_inference.onnx'")
 
-#6. Export Conditional Decoder
+#7. Export Conditional Decoder
 class ConditionalDecoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -655,7 +858,7 @@ print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'condit
 
 speech_feat = cond_decoder(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
 
-#7. Export STFTWrapper
+#8. Export STFTWrapper
 class STFTWrapper(nn.Module):
     def __init__(self):
         super().__init__()
@@ -700,7 +903,7 @@ torch.onnx.export(
 )
 print(f"✅ STFTWrapper ONNX export is completed. Model saved as 'stft_wrapper.onnx'")
 
-#8. Export HiFTGenerator
+#9. Export HiFTGenerator
 class HiFTGenerator(nn.Module):
     def __init__(self):
         super().__init__()
@@ -766,7 +969,7 @@ torch.onnx.export(
 )
 print(f"✅ HiFTGenerator ONNX export is completed. Model saved as 'hift_generator.onnx'")
 
-#9. Post-processing
+#10. Post-processing
 for f in os.listdir(output_dir):
     p = os.path.join(output_dir, f)
     onnxslim.slim(p, p)
