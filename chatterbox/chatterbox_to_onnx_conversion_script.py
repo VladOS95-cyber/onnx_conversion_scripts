@@ -729,7 +729,7 @@ class ISTFT(torch.nn.Module):
         inverse_transform = inverse_transform[:, 0, q:-q]
         return inverse_transform
 
-istft = ISTFT(ISTFT_PARAMS["n_fft"], ISTFT_PARAMS["hop_len"], ISTFT_PARAMS["hop_len"])
+istft = ISTFT(ISTFT_PARAMS["n_fft"], ISTFT_PARAMS["hop_len"], ISTFT_PARAMS["n_fft"])
 
 #6. Export Conditional Decoder
 class ConditionalDecoder(nn.Module):
