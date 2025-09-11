@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 from transformers.generation.logits_process import MinPLogitsWarper, RepetitionPenaltyLogitsProcessor, TopPLogitsWarper
 from tqdm import tqdm
-from scipy.signal import get_window
 import perth
 import librosa
 
@@ -24,16 +23,6 @@ start_text_token = 255
 stop_text_token = 0
 start_speech_token = 6561
 stop_speech_token = 6562
-CFM_PARAMS = {
-    "sigma_min": 1e-06,
-    "solver": "euler",
-    "t_scheduler": "cosine",
-    "training_cfg_rate": 0.2,
-    "inference_cfg_rate": 0.7,
-    "reg_loss_type": "l1"
-}
-n_timesteps = 10
-temperature = 1.0
 
 def drop_invalid_tokens(x):
     """Drop SoS and EoS"""
@@ -50,34 +39,6 @@ def drop_invalid_tokens(x):
 
     x = x[s: e]
     return x
-
-def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
-        """Make mask tensor containing indices of padded part.
-
-        See description of make_non_pad_mask.
-
-        Args:
-            lengths (torch.Tensor): Batch of lengths (B,).
-        Returns:
-            torch.Tensor: Mask tensor containing indices of padded part.
-
-        Examples:
-            >>> lengths = [5, 3, 2]
-            >>> make_pad_mask(lengths)
-            masks = [[0, 0, 0, 0 ,0],
-                        [0, 0, 0, 1, 1],
-                        [0, 0, 1, 1, 1]]
-        """
-        batch_size = lengths.size(0)
-        max_len = max_len if max_len > 0 else lengths.max().item()
-        seq_range = torch.arange(0,
-                                max_len,
-                                dtype=torch.int64,
-                                device=lengths.device)
-        seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
-        seq_length_expand = lengths.unsqueeze(-1)
-        mask = seq_range_expand >= seq_length_expand
-        return mask
 
 def pad_list(xs, pad_value):
     """Perform padding for the list of tensors.
@@ -117,29 +78,22 @@ output_file_name = "infer_output.wav"
 model_id = "onnx-community/chatterbox-onnx"
 text = "The Lord of the Rings is the greatest work of literature."
 audio = None
-target_voice_path = "back_4_more_fun.wav"
+target_voice_path = None
 
 ## Load model
 speech_encoder_path = hf_hub_download(repo_id=model_id, filename="speech_encoder.onnx", local_dir=output_dir)
 speech_embedding_path = hf_hub_download(repo_id=model_id, filename="speech_embedding.onnx", local_dir=output_dir)
 language_model_path = hf_hub_download(repo_id=model_id, filename="language_model.onnx", local_dir=output_dir, subfolder='onnx')
 hf_hub_download(repo_id=model_id, filename="language_model.onnx_data", local_dir=output_dir, subfolder='onnx')
-conditional_decoder_path = hf_hub_download(repo_id=model_id, filename="conditional_decoder.onnx", local_dir=output_dir)
-flow_inference_path = hf_hub_download(repo_id=model_id, filename="flow_inference.onnx", local_dir=output_dir)
-stft_wrapper_path = hf_hub_download(repo_id=model_id, filename="stft_wrapper.onnx", local_dir=output_dir)
-hift_generator_path = hf_hub_download(repo_id=model_id, filename="hift_generator.onnx", local_dir=output_dir)
+conditional_decoder_path = hf_hub_download(repo_id=model_id, filename="conditional_decoder.onnx", local_dir=output_dir, subfolder='onnx')
 tokenizer_path = hf_hub_download(repo_id=model_id, filename="speech_tokenizer_v2.onnx", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="tokenizer.json", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="conds.pt", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="tokenizer.json", local_dir=output_dir)
-hf_hub_download(repo_id=model_id, filename="vc_tokenizer_weights.pth", local_dir=output_dir)
 conds = Conditionals.load("converted/conds.pt")
 
 ## Start common inferense sessions
 tokenizer_session = onnxruntime.InferenceSession(tokenizer_path)
-flow_inference_session = onnxruntime.InferenceSession(flow_inference_path)
-stft_wrapper_session = onnxruntime.InferenceSession(stft_wrapper_path)
-hift_generator_session = onnxruntime.InferenceSession(hift_generator_path)
 cond_decoder_session = onnxruntime.InferenceSession(conditional_decoder_path)
 
 def set_target_voice(wav_fpath):
@@ -333,93 +287,15 @@ speech_tokens, token_len = None, None
 #     speech_tokens, token_len = execute_audio_to_audio_inference(audio, ref_dict)
 # else:
 speech_tokens, token_len = execute_text_to_audio_inference(text, ref_dict, conds)
-
-mask = (~make_pad_mask(torch.from_numpy(token_len))).unsqueeze(-1)
-flow_infer_input = {
+cond_incoder_input = {
     "speech_tokens": speech_tokens,
     "token_len": token_len,
-    "mask": mask.detach().numpy().astype(np.int64),
     "embedding": ref_dict["embedding"],
     "prompt_feat": ref_dict["prompt_feat"],
 }
-mel_len1, mel_len2, mu, spks, cond = flow_inference_session.run(None, flow_infer_input)
-mu = np.ascontiguousarray(np.transpose(mu, (0, 2, 1)))
-
-## Conditional decoding
-total_len = torch.tensor([mel_len1 + mel_len2])
-mask = (~make_pad_mask(total_len)).squeeze(0).detach().numpy()
-rand_noise = torch.randn([1, 80, 50 * 300])
-B, _, T = mu.shape
-n_timesteps = 10
-temperature = 1.0
-x = rand_noise[:, :, :T].to(mu.device).detach().numpy() * temperature
-t_span = torch.linspace(0, 1, n_timesteps+1, device=mu.device)
-t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-t_span = t_span.detach().numpy()
-t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
-x_in = np.zeros([2, 80, T])
-mask_in = np.zeros([2, 1, T])
-mu_in = np.zeros([2, 80, T])
-t_in = np.zeros([2])
-spks_in = np.zeros([2, 80])
-cond_in = np.zeros([2, 80, T])
-sol = []
-for i in range(1, len(t_span)):
-    # Classifier-Free Guidance inference introduced in VoiceBox
-    x_in[:] = x
-    mask_in[:] = mask
-    mu_in[0] = mu
-    t_in[:] = t
-    spks_in[0] = spks
-    cond_in[0] = cond
-    ort_cond_decoder_input = {
-        "x_in": x_in.astype(np.float32), 
-        "mask_in": mask_in.astype(np.float32), 
-        "mu_in": mu_in.astype(np.float32), 
-        "t_in": t_in.astype(np.float32), 
-        "spks_in": spks_in.astype(np.float32),
-        "cond_in": cond_in.astype(np.float32)
-    }
-    dphi_dt = cond_decoder_session.run(None, ort_cond_decoder_input)
-    dphi_dt, cfg_dphi_dt = torch.split(torch.from_numpy(dphi_dt[0]), [B, B], dim=0)
-    dphi_dt = (1.0 + CFM_PARAMS["inference_cfg_rate"]) * dphi_dt - CFM_PARAMS["inference_cfg_rate"] * cfg_dphi_dt
-
-    x = x + dt * dphi_dt.detach().numpy()
-    t = t + dt
-    sol.append(x)
-    if i < len(t_span) - 1:
-        dt = t_span[i + 1] - t
-
-output_mels = sol[-1]
-output_mels = output_mels[:, :, mel_len1.item():]
-
-stft_ort_wrapper_input = {
-    "speech_feat": output_mels
-}
-output_sources = stft_wrapper_session.run(None, stft_ort_wrapper_input)
-istft_params = {"n_fft": 16, "hop_len": 4}
-def _istft(magnitude, phase):
-    stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
-    magnitude = torch.clip(magnitude, max=1e2)
-    real = magnitude * torch.cos(phase)
-    img = magnitude * torch.sin(phase)
-    inverse_transform = torch.istft(torch.complex(real, img), istft_params["n_fft"], istft_params["hop_len"],
-                                    istft_params["n_fft"], window=stft_window.to(magnitude.device))
-    return inverse_transform
-
-hift_generator_ort_input = {
-    "speech_feat": output_mels,
-    "output_sources": output_sources[0]
-}
-magnitude, phase = hift_generator_session.run(None, hift_generator_ort_input)
-output_wavs = _istft(torch.from_numpy(magnitude), torch.from_numpy(phase))
-n_trim = S3GEN_SR // 50  # 20ms = half of a frame
-trim_fade = torch.zeros(2 * n_trim)
-trim_fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
-output_wavs[:, :len(trim_fade)] *= trim_fade
-wav = output_wavs.squeeze(0).detach().cpu().numpy()
+wav = cond_decoder_session.run(None, cond_incoder_input)[0]
 watermarker = perth.PerthImplicitWatermarker()
-watermarked_wav = watermarker.apply_watermark(wav, sample_rate=S3GEN_SR)
+watermarked_wav = watermarker.apply_watermark(np.squeeze(wav, axis=0), sample_rate=S3GEN_SR)
 watermarked_wav = torch.from_numpy(watermarked_wav).unsqueeze(0)
 ta.save(output_file_name, watermarked_wav, S3GEN_SR)
 print(f"{output_file_name} was successfully saved")
