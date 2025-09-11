@@ -1103,7 +1103,6 @@ class ConditionalDecoder(nn.Module):
         return output_wavs
 
 cond_decoder = ConditionalDecoder()
-test = cond_decoder(speech_tokens, token_len, embedding, prompt_feat)
 torch.onnx.export(
     cond_decoder,
     (speech_tokens, token_len, embedding, prompt_feat),
