@@ -3,13 +3,12 @@ import numpy as np
 from huggingface_hub import hf_hub_download
 from chatterbox.tts import Conditionals
 import torchaudio as ta
-from tokenizers import Tokenizer
 import torch
-import torch.nn.functional as F
 from transformers.generation.logits_process import MinPLogitsWarper, RepetitionPenaltyLogitsProcessor, TopPLogitsWarper
 from tqdm import tqdm
 import perth
 import librosa
+from transformers import AutoTokenizer
 
 SPACE = "[SPACE]"
 SPEECH_VOCAB_SIZE = 6561
@@ -87,9 +86,7 @@ language_model_path = hf_hub_download(repo_id=model_id, filename="language_model
 hf_hub_download(repo_id=model_id, filename="language_model.onnx_data", local_dir=output_dir, subfolder='onnx')
 conditional_decoder_path = hf_hub_download(repo_id=model_id, filename="conditional_decoder.onnx", local_dir=output_dir, subfolder='onnx')
 tokenizer_path = hf_hub_download(repo_id=model_id, filename="speech_tokenizer_v2.onnx", local_dir=output_dir)
-hf_hub_download(repo_id=model_id, filename="tokenizer.json", local_dir=output_dir)
 hf_hub_download(repo_id=model_id, filename="conds.pt", local_dir=output_dir)
-hf_hub_download(repo_id=model_id, filename="tokenizer.json", local_dir=output_dir)
 conds = Conditionals.load("converted/conds.pt")
 
 ## Start common inferense sessions
@@ -157,13 +154,11 @@ def execute_text_to_audio_inference(text, ref_dict, conds):
     speech_embedding_session = onnxruntime.InferenceSession(speech_embedding_path)
 
     ## Prepare input
-    tokenizer = Tokenizer.from_file(f"{output_dir}/tokenizer.json")
     text = text.replace(' ', SPACE)
-    text_tokens_ids = tokenizer.encode(text).ids
+    tokenizer = AutoTokenizer.from_pretrained("vladislavbro/llama_backbone_0.5")
+    text_tokens_ids = tokenizer(text)["input_ids"]
     text_tokens_ids = torch.IntTensor(text_tokens_ids).unsqueeze(0)
     text_tokens_ids = torch.cat([text_tokens_ids, text_tokens_ids], dim=0)
-    text_tokens_ids = F.pad(text_tokens_ids, (1, 0), value=start_text_token)
-    text_tokens_ids = F.pad(text_tokens_ids, (0, 1), value=stop_text_token)
     text_tokens_ids = torch.atleast_2d(text_tokens_ids).to(dtype=torch.long)
     speech_input_ids = start_speech_token * torch.ones_like(text_tokens_ids[:, :1])
     emotion_adv= 0.5 * torch.ones(1, 1, 1)
