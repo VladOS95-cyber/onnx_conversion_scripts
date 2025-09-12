@@ -18,8 +18,6 @@ S3GEN_SR = 24000
 # Sampling rate of the inputs to S3TokenizerV2
 S3_SR = 16_000
 DEC_COND_LEN = 10 * S3GEN_SR
-start_text_token = 255
-stop_text_token = 0
 start_speech_token = 6561
 stop_speech_token = 6562
 
