@@ -118,7 +118,6 @@ def pad_list(xs, pad_value):
 
 model = ChatterboxTTS.from_pretrained(device="cpu")
 config = model.t3.hp
-# test = model.generate("The Lord of the Rings is the greatest work of literature.")
 
 output_dir = "converted"
 os.makedirs(output_dir, exist_ok=True)

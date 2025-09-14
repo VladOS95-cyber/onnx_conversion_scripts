@@ -153,7 +153,7 @@ def execute_text_to_audio_inference(text, ref_dict, conds):
 
     ## Prepare input
     text = text.replace(' ', SPACE)
-    tokenizer = AutoTokenizer.from_pretrained("vladislavbro/llama_backbone_0.5")
+    tokenizer = AutoTokenizer.from_pretrained("onnx-community/chatterbox-onnx")
     text_tokens_ids = tokenizer(text)["input_ids"]
     text_tokens_ids = torch.IntTensor(text_tokens_ids).unsqueeze(0)
     text_tokens_ids = torch.cat([text_tokens_ids, text_tokens_ids], dim=0)
