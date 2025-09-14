@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from chatterbox.tts import ChatterboxTTS, T3Cond
 import onnxslim
 import os
-from einops import pack, rearrange, repeat
 import torchaudio as ta
 from librosa.filters import mel as librosa_mel_fn
 from torchaudio.compliance.kaldi import get_mel_banks
@@ -786,37 +785,33 @@ class ConditionalDecoder(nn.Module):
         t = self.time_embeddings(t).to(t.dtype)
         t = self.time_mlp(t)
 
-        x = pack([x, mu], "b * t")[0]
+        x = torch.cat([x, mu], dim=1)
+        spks = spks.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        x = torch.cat([x, spks], dim=1)
+        x = torch.cat([x, cond], dim=1)
 
-        if spks is not None:
-            spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
-            x = pack([x, spks], "b * t")[0]
-        if cond is not None:
-            x = pack([x, cond], "b * t")[0]
-
-        hiddens = []
         masks = [mask]
-        for resnet, transformer_blocks, downsample in self.down_blocks:
-            mask_down = masks[-1]
-            x = resnet(x, mask_down, t)
-            x = rearrange(x, "b c t -> b t c").contiguous()
-            attn_mask = mask_to_bias(mask_down.bool() == 1, x.dtype)
-            for transformer_block in transformer_blocks:
-                x = transformer_block(
-                    hidden_states=x,
-                    attention_mask=attn_mask,
-                    timestep=t,
-                )
-            x = rearrange(x, "b t c -> b c t").contiguous()
-            hiddens.append(x)  # Save hidden states for skip connections
-            x = downsample(x * mask_down)
-            masks.append(mask_down[:, :, ::2])
+        resnet, transformer_blocks, downsample = self.down_blocks[0]
+        mask_down = masks[-1]
+        x = resnet(x, mask_down, t)
+        x = x.permute(0, 2, 1).contiguous()
+        attn_mask = mask_to_bias(mask_down.bool() == 1, x.dtype)
+        for transformer_block in transformer_blocks:
+            x = transformer_block(
+                hidden_states=x,
+                attention_mask=attn_mask,
+                timestep=t,
+            )
+        x = x.permute(0, 2, 1).contiguous()
+        residual = x  # Save hidden states for skip connections
+        x = downsample(x * mask_down)
+        masks.append(mask_down[:, :, ::2])
         masks = masks[:-1]
         mask_mid = masks[-1]
 
         for resnet, transformer_blocks in self.mid_blocks:
             x = resnet(x, mask_mid, t)
-            x = rearrange(x, "b c t -> b t c").contiguous()
+            x = x.permute(0, 2, 1).contiguous()
             attn_mask = mask_to_bias(mask_mid.bool() == 1, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
@@ -824,23 +819,22 @@ class ConditionalDecoder(nn.Module):
                     attention_mask=attn_mask,
                     timestep=t,
                 )
-            x = rearrange(x, "b t c -> b c t").contiguous()
+            x = x.permute(0, 2, 1).contiguous() 
 
-        for resnet, transformer_blocks, upsample in self.up_blocks:
-            mask_up = masks.pop()
-            skip = hiddens.pop()
-            x = pack([x[:, :, :skip.shape[-1]], skip], "b * t")[0]
-            x = resnet(x, mask_up, t)
-            x = rearrange(x, "b c t -> b t c").contiguous()
-            attn_mask = mask_to_bias(mask_up.bool() == 1, x.dtype)
-            for transformer_block in transformer_blocks:
-                x = transformer_block(
-                    hidden_states=x,
-                    attention_mask=attn_mask,
-                    timestep=t,
-                )
-            x = rearrange(x, "b t c -> b c t").contiguous()
-            x = upsample(x * mask_up)
+        resnet, transformer_blocks, upsample = self.up_blocks[0]
+        mask_up = masks.pop()
+        x = torch.cat([x[:, :, :residual.shape[-1]], residual], dim=1)
+        x = resnet(x, mask_up, t)
+        x = x.permute(0, 2, 1).contiguous()
+        attn_mask = mask_to_bias(mask_up.bool() == 1, x.dtype)
+        for transformer_block in transformer_blocks:
+            x = transformer_block(
+                hidden_states=x,
+                attention_mask=attn_mask,
+                timestep=t,
+            )
+        x = x.permute(0, 2, 1).contiguous()
+        x = upsample(x * mask_up)
         x = self.final_block(x, mask_up)
         output = self.final_proj(x * mask_up)
         return output
