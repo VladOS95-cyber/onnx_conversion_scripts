@@ -638,6 +638,13 @@ class PrepareConditionalsModel(torch.nn.Module):
 
         self.speech_emb = chatterbox.t3.speech_emb
         self.speech_pos_emb = chatterbox.t3.speech_pos_emb
+
+        #default conditions
+        self.t3_cond = chatterbox.conds.t3
+        self.prompt_token = chatterbox.conds.gen["prompt_token"]
+        self.embedding = chatterbox.conds.gen["embedding"]
+        self.prompt_feat = chatterbox.conds.gen["prompt_feat"]
+
     
 
         # Speaker embedding projection
@@ -832,11 +839,7 @@ class PrepareConditionalsModel(torch.nn.Module):
         mel_energies = torch.max(mel_energies, self.eps).log()
         return mel_energies
 
-    def forward(
-        self,
-        audio_values: torch.Tensor, # NOTE: Must have sample rate of S3GEN_SR=24000
-        exaggeration: float = 0.5,
-    ):
+    def prepare_conditions_from_audio(self, audio_values, exaggeration):
         batch_size = audio_values.shape[0]
 
         # Compute embed_ref
@@ -885,7 +888,27 @@ class PrepareConditionalsModel(torch.nn.Module):
             cond_emotion_adv,
         ), dim=1)  # (B, len_cond, dim)
         # assert cond_emb.dim() == 3
+        return cond_emb, prompt_token, ref_x_vector, prompt_feat
 
+    def prepare_conditioning(self, audio_values):
+        """
+        Token cond data needs to be embedded, so that needs to be here instead of in `T3CondEnc`.
+        """
+        t3_cond = self.t3_cond
+        t3_cond.cond_prompt_speech_emb = self.speech_emb(t3_cond.cond_prompt_speech_tokens) + \
+            self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
+        cond_emb = self.cond_enc(t3_cond)
+        prompt_token = self.prompt_token
+        ref_x_vector = self.embedding
+        prompt_feat = self.prompt_feat
+        return cond_emb, prompt_token, ref_x_vector, prompt_feat
+
+    def forward(
+        self,
+        audio_values: torch.Tensor, # NOTE: Must have sample rate of S3GEN_SR=24000
+        exaggeration: float = 0.5,
+    ):
+        cond_emb, prompt_token, ref_x_vector, prompt_feat = self.prepare_conditions_from_audio(audio_values, exaggeration)
         return cond_emb, prompt_token, ref_x_vector, prompt_feat
 
 
@@ -1500,11 +1523,10 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
     embed_tokens = InputsEmbeds(chatterbox_model).eval()
     cond_decoder = ConditionalDecoder(chatterbox_model).eval()
 
-    # For testing:
-    # chatterbox_model.prepare_conditionals(AUDIO_PROMPT_PATH, exaggeration=2)
-
-    audio_values, _sr = librosa.load(audio_prompt_path, sr=S3GEN_SR)
-    audio_values = torch.from_numpy(audio_values).unsqueeze(0)
+    audio_values = None
+    if audio_prompt_path:
+        audio_values, _sr = librosa.load(audio_prompt_path, sr=S3GEN_SR)
+        audio_values = torch.from_numpy(audio_values).unsqueeze(0)
 
     start_speech_token = 6561
     stop_speech_token = 6562
@@ -1565,6 +1587,7 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
 
 
     # Example run
+    # audio_values = torch.randn(1, 0) if not audio_values else audio_values
     cond_emb, prompt_token, ref_x_vector, prompt_feat = prepare_conditionals(audio_values=audio_values, exaggeration=exaggeration)
 
     text_emb = embed_tokens(input_ids=input_ids, position_ids=position_ids)
@@ -1654,4 +1677,4 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
 
 
 if __name__ == "__main__":
-    export_model_to_onnx()
+    export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=False, audio_prompt_path=None, output_export_dir=None, output_file_name="output.wav")
