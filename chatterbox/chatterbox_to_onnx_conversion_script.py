@@ -1,21 +1,35 @@
-# # !pip install --upgrade onnx==1.17.0 onnxruntime==1.20.1 onnxslim==0.1.48 transformers==4.48.3 chatterbox-tts==0.1.2
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
-from chatterbox.tts import ChatterboxTTS, T3Cond
-import onnxslim
-import os
-import torchaudio as ta
-from librosa.filters import mel as librosa_mel_fn
-from torchaudio.compliance.kaldi import get_mel_banks
-from typing import Tuple
-import math
-import librosa
-import numpy as np
 
-MILLISECONDS_TO_SECONDS = 0.001
+import torchaudio as ta
+from torchaudio.compliance.kaldi import get_mel_banks
+
+from s3tokenizer.model import Conv1d, LayerNorm, Linear, MultiHeadAttention
+from s3tokenizer.utils import mask_to_bias
+
+import numpy as np
+import librosa
+from librosa.filters import mel as librosa_mel_fn
+import math
+from tqdm import tqdm
+
+
+# Sampling rate of the inputs to S3TokenizerV2
+S3GEN_SR = 24000
+S3_SR = 16_000
+S3_HOP = 160  # 100 frames/sec
+S3_TOKEN_HOP = 640  # 25 tokens/sec
+S3_TOKEN_RATE = 25
 SPEECH_VOCAB_SIZE = 6561
+MILLISECONDS_TO_SECONDS = 0.001
+
+ENC_COND_LEN = 6 * S3_SR
+DEC_COND_LEN = 10 * S3GEN_SR
+
 SOS = SPEECH_VOCAB_SIZE
 EOS = SPEECH_VOCAB_SIZE + 1
 CFM_PARAMS = {
@@ -27,226 +41,583 @@ CFM_PARAMS = {
     "reg_loss_type": "l1"
 }
 ISTFT_PARAMS = {"n_fft": 16, "hop_len": 4}
-S3GEN_SR = 24000
-S3_SR = 16_000
-S3_HOP = 160  # 100 frames/sec
 
 # override certain torch functions
 torch.Tensor.item = lambda x: x # no-op
 
-def create_dummy_inputs(hp, batch_size=2, text_len=40):
-    speaker_emb = torch.randn(batch_size, hp.speaker_embed_size)
-    cond_prompt_speech_tokens = torch.randint(
-        0, hp.speech_tokens_dict_size, (batch_size, hp.speech_cond_prompt_len)
-    )
-    emotion_adv = 0.5 * torch.ones(batch_size, 1, 1)
-    text_tokens_ids = torch.randint(
-        0, hp.text_tokens_dict_size, (batch_size, text_len)
-    )
-    sot = hp.start_text_token
-    eot = hp.stop_text_token
-    text_tokens_ids = F.pad(text_tokens_ids, (1, 0), value=sot)
-    text_tokens_ids = F.pad(text_tokens_ids, (0, 1), value=eot)
-    speech_input_ids = hp.start_speech_token * torch.ones_like(text_tokens_ids[:, :1])
-    return speaker_emb, cond_prompt_speech_tokens, emotion_adv, text_tokens_ids, speech_input_ids
 
-def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
-        """Make mask tensor containing indices of padded part.
+@dataclass
+class ModelConfig:
+    n_mels: int = 128
+    n_audio_ctx: int = 1500
+    n_audio_state: int = 1280
+    n_audio_head: int = 20
+    n_audio_layer: int = 6
+    n_codebook_size: int = 3**8
 
-        See description of make_non_pad_mask.
+    use_sdpa: bool = False
 
-        Args:
-            lengths (torch.Tensor): Batch of lengths (B,).
-        Returns:
-            torch.Tensor: Mask tensor containing indices of padded part.
+def make_non_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
+    """Make mask tensor containing indices of non-padded part.
 
-        Examples:
-            >>> lengths = [5, 3, 2]
-            >>> make_pad_mask(lengths)
-            masks = [[0, 0, 0, 0 ,0],
-                        [0, 0, 0, 1, 1],
-                        [0, 0, 1, 1, 1]]
-        """
-        batch_size = lengths.size(0)
-        max_len = max_len if max_len > 0 else lengths.max().item()
-        seq_range = torch.arange(0,
-                                max_len,
-                                dtype=torch.int64,
-                                device=lengths.device)
-        seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
-        seq_length_expand = lengths.unsqueeze(-1)
-        mask = seq_range_expand >= seq_length_expand
-        return mask
+    The sequences in a batch may have different lengths. To enable
+    batch computing, padding is need to make all sequence in same
+    size. To avoid the padding part pass value to context dependent
+    block such as attention or convolution , this padding part is
+    masked.
 
-def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    assert mask.dtype == torch.bool
-    assert dtype in [torch.float32, torch.bfloat16, torch.float16]
-    mask = mask.to(dtype)
-    mask = (1.0 - mask) * -1.0e+10
-    return mask
+    1 for non-padded part and 0 for padded part.
 
-def pad_list(xs, pad_value):
-    """Perform padding for the list of tensors.
-
-    Args:
-        xs (List): List of Tensors [(T_1, `*`), (T_2, `*`), ..., (T_B, `*`)].
-        pad_value (float): Value for padding.
+    Parameters
+    ----------
+        lengths (torch.Tensor): Batch of lengths (B,).
 
     Returns:
-        Tensor: Padded tensor (B, Tmax, `*`).
+    -------
+        torch.Tensor: Mask tensor containing indices of padded part (B, max_T).
 
     Examples:
-        >>> x = [torch.ones(4), torch.ones(2), torch.ones(1)]
-        >>> x
-        [tensor([1., 1., 1., 1.]), tensor([1., 1.]), tensor([1.])]
-        >>> pad_list(x, 0)
-        tensor([[1., 1., 1., 1.],
-                [1., 1., 0., 0.],
-                [1., 0., 0., 0.]])
-
+        >>> import torch
+        >>> import s3tokenizer
+        >>> lengths = torch.tensor([5, 3, 2])
+        >>> masks = s3tokenizer.make_non_pad_mask(lengths)
+        masks = [[1, 1, 1, 1, 1],
+                 [1, 1, 1, 0, 0],
+                 [1, 1, 0, 0, 0]]
     """
-    n_batch = len(xs)
-    max_len = max(x.size(0) for x in xs)
-    pad = xs[0].new(n_batch, max_len, *xs[0].size()[1:]).fill_(pad_value)
+    batch_size = lengths.size(0)
+    # max_len = max_len if max_len > 0 else lengths.max()
+    max_len_2 = lengths.max()
+    seq_range = torch.arange(0,
+                             max_len_2,
+                             dtype=torch.int64,
+                             device=lengths.device)
+    seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len_2)
+    seq_length_expand = lengths.unsqueeze(-1)
+    return seq_range_expand < seq_length_expand
 
-    for i in range(n_batch):
-        pad[i, : xs[i].size(0)] = xs[i]
 
-    return pad
-
-
-model = ChatterboxTTS.from_pretrained(device="cpu")
-config = model.t3.hp
-
-output_dir = "converted"
-os.makedirs(output_dir, exist_ok=True)
-
-# 1. Export speech encoder
-class SpeechEncoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.cond_enc = model.t3.cond_enc
-        self.text_emb = model.t3.text_emb
-        self.speech_emb = model.t3.speech_emb
-        self.speech_pos_emb = model.t3.speech_pos_emb
-        self.text_pos_emb = model.t3.text_pos_emb
-        self.hp = model.t3.hp
-        self.perceiver = model.t3.cond_enc.perceiver
-        self.spkr_enc = model.t3.cond_enc.spkr_enc
-        self.emotion_adv_fc = model.t3.cond_enc.emotion_adv_fc
-        self.register_buffer("bos_token", torch.tensor([[self.hp.start_speech_token]], dtype=torch.long))
+def precompute_freqs_cis(dim: int,
+                         end: int,
+                         theta: float = 10000.0,
+                         scaling=None):
+    freqs = 1.0 / (theta**(torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    if scaling is not None:
+        t = t * scaling
+    freqs = torch.outer(t, freqs).float()  # type: ignore
     
-    def conditional_encoding(self, cond: T3Cond):
-        # Validate
-        assert (cond.cond_prompt_speech_tokens is None) == (cond.cond_prompt_speech_emb is None), \
-            "no embeddings for cond_prompt_speech_tokens"
+    cos = freqs.cos()
+    sin = freqs.sin()
+    
+    cos = torch.cat((cos, cos), dim=-1)
+    sin = torch.cat((sin, sin), dim=-1)
+    return cos, sin
 
-        # Speaker embedding projection
-        cond_spkr = self.spkr_enc(cond.speaker_emb.view(-1, self.hp.speaker_embed_size))[:, None]  # (B, 1, dim)
-        empty = torch.zeros_like(cond_spkr[:, :0])  # (B, 0, dim)
 
-        # TODO CLAP
-        assert cond.clap_emb is None, "clap_embed not implemented"
-        cond_clap = empty  # (B, 0, dim)
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
 
-        # Cond prompt
-        cond_prompt_speech_emb = cond.cond_prompt_speech_emb
-        if cond_prompt_speech_emb is None:
-            cond_prompt_speech_emb = empty  # (B, 0, dim)
-        elif self.hp.use_perceiver_resampler:
-            cond_prompt_speech_emb = self.perceiver(cond_prompt_speech_emb)
+    D = xq.shape[-1]
+    half_l, half_r = xq[:, :, :, :D // 2], xq[:, :, :, D // 2:]
+    xq_r = torch.cat((-half_r, half_l), dim=-1)
 
-        # Emotion Adv: must provide a value if this model uses emotion conditioning
-        cond_emotion_adv = empty  # (B, 0, dim)
-        B = cond.emotion_adv.shape[0]
-        if self.hp.emotion_adv:
-            assert cond.emotion_adv is not None
-            cond_emotion_adv = self.emotion_adv_fc(cond.emotion_adv.reshape(B, 1, 1))
+    D = xk.shape[-1]
 
-        # Concat and return
-        cond_embeds = torch.cat((
-            cond_spkr,
-            cond_clap,
-            cond_prompt_speech_emb,
-            cond_emotion_adv,
-        ), dim=1)
-        return cond_embeds
+    half_l, half_r = xk[:, :, :, :D // 2], xk[:, :, :, D // 2:]
+    xk_r = torch.cat((-half_r, half_l), dim=-1)
 
-    def forward(self, 
-                speaker_emb, 
-                cond_prompt_speech_tokens, 
-                emotion_adv,
-                text_tokens_ids,
-                speech_input_ids):
-        t3_cond = T3Cond(
-            speaker_emb=speaker_emb,
-            clap_emb=None,
-            cond_prompt_speech_tokens=cond_prompt_speech_tokens,
-            cond_prompt_speech_emb=None,
-            emotion_adv=emotion_adv
+    return xq * cos + xq_r * sin, xk * cos + xk_r * sin
+
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [
+        d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)
+    ]
+    return freqs_cis.view(*shape)
+
+
+class FSQCodebook(nn.Module):
+
+    def __init__(self, dim: int, level: int = 3):
+        super().__init__()
+        self.project_down = nn.Linear(dim, 8)
+        self.level = level
+        self.embed = None
+
+    @torch.inference_mode()
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        # x = rearrange(x, "... d -> (...) d")
+        x = x.reshape(-1, x.shape[-1])
+        return x
+
+    @torch.inference_mode()
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        x_shape = x.shape
+        # pre-process
+        x = self.preprocess(x)
+        # quantize
+        h = self.project_down(x).float()
+        h = h.tanh()
+        h = h * 0.9990000128746033
+        h = h.round() + 1
+        # h = ((self.level - 1) * h).round()  # range [-k, k]
+        powers = torch.pow(
+            self.level,
+            torch.arange(2**self.level, device=x.device, dtype=h.dtype))
+        mu = torch.sum(h * powers.unsqueeze(0), dim=-1)
+        ind = mu.reshape(x_shape[0], x_shape[1])
+        return ind
+
+    @torch.inference_mode()
+    def decode(self, embed_ind: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            'There is no official up project component provided')
+
+
+class FSQVectorQuantization(nn.Module):
+    """Vector quantization implementation (inference-only).
+    Args:
+        dim (int): Dimension
+        codebook_size (int): Codebook size
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        codebook_size: int,
+    ):
+        super().__init__()
+        assert 3**8 == codebook_size
+        self._codebook = FSQCodebook(dim=dim, level=3)
+        self.codebook_size = codebook_size
+
+    @property
+    def codebook(self):
+        return self._codebook.embed
+
+    @torch.inference_mode()
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self._codebook.encode(x)
+
+    @torch.inference_mode()
+    def decode(self, embed_ind: torch.Tensor) -> torch.Tensor:
+        quantize = self._codebook.decode(embed_ind)
+        # quantize = rearrange(quantize, "b n d -> b d n")
+        quantize = quantize.permute(0, 2, 1)
+        return quantize
+
+
+class FSMNMultiHeadAttention(MultiHeadAttention):
+
+    def __init__(
+        self,
+        n_state: int,
+        n_head: int,
+        kernel_size: int = 31,
+        use_sdpa: bool = False,
+    ):
+        super().__init__(n_state, n_head)
+
+        self.fsmn_block = nn.Conv1d(n_state,
+                                          n_state,
+                                          kernel_size,
+                                          stride=1,
+                                          padding=0,
+                                          groups=n_state,
+                                          bias=False)
+        self.left_padding = (kernel_size - 1) // 2
+        self.right_padding = kernel_size - 1 - self.left_padding
+        self.pad_fn = nn.ConstantPad1d(
+            (self.left_padding, self.right_padding), 0.0)
+
+        self.use_sdpa = use_sdpa
+
+    def forward_fsmn(self,
+                     inputs: torch.Tensor,
+                     mask: Optional[torch.Tensor] = None):
+        b, t, _, _ = inputs.size()
+        inputs = inputs.view(b, t, -1)
+        if mask is not None and mask.size(2) > 0:  # time2 > 0
+            inputs = inputs * mask
+        x = inputs.transpose(1, 2)
+        x = self.pad_fn(x)
+        x = self.fsmn_block(x)
+        x = x.transpose(1, 2)
+        x += inputs
+        return x * mask
+
+    def qkv_attention(self,
+                      q: torch.Tensor,
+                      k: torch.Tensor,
+                      v: torch.Tensor,
+                      mask: Optional[torch.Tensor] = None,
+                      mask_pad: Optional[torch.Tensor] = None,
+                      cos: Optional[torch.Tensor] = None,
+                      sin: Optional[torch.Tensor] = None):
+        _, _, D = q.shape
+        scale = (D // self.n_head)**-0.25
+        q = q.view(*q.shape[:2], self.n_head, -1)
+        k = k.view(*k.shape[:2], self.n_head, -1)
+        v = v.view(*v.shape[:2], self.n_head, -1)
+
+        if cos is not None and sin is not None:
+            q, k = apply_rotary_emb(q, k, cos=cos, sin=sin)
+
+        fsm_memory = self.forward_fsmn(v, mask_pad)
+
+        q = q.permute(0, 2, 1, 3) * scale
+        v = v.permute(0, 2, 1, 3)
+
+        if not self.use_sdpa:
+            k = k.permute(0, 2, 3, 1) * scale
+            qk = q @ k  # (B, n_head, T, T)
+            if mask is not None:
+                qk = qk + mask
+            qk = qk.float()
+            w = F.softmax(qk, dim=-1).to(q.dtype)
+            return (w @ v).permute(
+                0, 2, 1, 3).flatten(start_dim=2), qk.detach(), fsm_memory
+        else:
+            k = k.permute(0, 2, 1, 3) * scale
+            assert mask is not None
+            output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=0.,
+                scale=1.,
             )
-        text_tokens_ids = torch.atleast_2d(text_tokens_ids)
-        t3_cond.cond_prompt_speech_emb = self.speech_emb(t3_cond.cond_prompt_speech_tokens) + \
-            self.speech_pos_emb(t3_cond.cond_prompt_speech_tokens)
-        cond_emb = self.conditional_encoding(t3_cond)
-        text_emb = self.text_emb(text_tokens_ids)
-        text_emb[1::2].zero_() # CFG uncond
-        speech_emb = self.speech_emb(speech_input_ids)
-        if self.hp.input_pos_emb == "learned":
-            text_emb = text_emb + self.text_pos_emb(text_tokens_ids)
-            speech_emb = speech_emb + self.speech_pos_emb(speech_input_ids)
-        len_cond = cond_emb.size(1)
-        cond_emb = cond_emb.expand(text_emb.shape[0], -1, -1)
+            output = (output.transpose(1,
+                                       2).contiguous().view(q.size(0), -1, D)
+                      )  # (batch, time1, d_model)
+            return output, None, fsm_memory
 
-        # concat
-        inputs_embeds = torch.cat((cond_emb, text_emb, speech_emb), dim=1) # (B, length, dim)
-        bos_embed = self.speech_emb(self.bos_token)
-        idx = torch.zeros((1, 1), dtype=torch.long, device=inputs_embeds.device)
-        pos_embed =  self.speech_pos_emb(idx)
-        bos_embed = bos_embed + pos_embed
-        batch_size = inputs_embeds.size(0)
-        bos_embed = bos_embed.expand(batch_size, -1, -1)
-        inputs_embeds = torch.cat([inputs_embeds, bos_embed], dim=1)
-        return inputs_embeds, len_cond
+    def forward(self,
+                x: torch.Tensor,
+                mask: Optional[torch.Tensor] = None,
+                mask_pad: Optional[torch.Tensor] = None,
+                cos: Optional[torch.Tensor] = None,
+                sin: Optional[torch.Tensor] = None):
 
-speaker_emb, cond_prompt_speech_tokens, emotion_adv, text_tokens_ids, speech_input_ids = create_dummy_inputs(config)
-embedder_model = SpeechEncoder()
-inputs_embeds, _ = embedder_model(speaker_emb, cond_prompt_speech_tokens, emotion_adv, text_tokens_ids, speech_input_ids)
-ort_speech_encoder_inputs = {
-    "speaker_emb": speaker_emb.cpu().numpy(),
-    "cond_prompt_speech_tokens": cond_prompt_speech_tokens.cpu().numpy(),
-    "emotion_adv": emotion_adv.cpu().numpy(),
-    "text_tokens_ids": text_tokens_ids.cpu().numpy(),
-    "speech_input_ids": speech_input_ids.cpu().numpy()
-}
-for k, v in ort_speech_encoder_inputs.items():
-    print(f'{k=}, {v.shape=}')
-torch.onnx.export(
-    embedder_model,
-    (speaker_emb, cond_prompt_speech_tokens, emotion_adv, text_tokens_ids, speech_input_ids),
-    f"{output_dir}/speech_encoder.onnx",
-    export_params=True,
-    opset_version=14,
-    input_names=["speaker_emb", "cond_prompt_speech_tokens", "emotion_adv", "text_tokens_ids", "speech_input_ids"],
-    output_names=["inputs_embeds", "len_cond"],
-    dynamic_axes={
-        "speaker_emb": {0: "batch_size"},
-        "cond_prompt_speech_tokens": {0: "batch_size", 1: "seq_len_cond"},
-        "emotion_adv": {0: "batch_size"},
-        "text_tokens_ids": {0: "batch_size", 1: "seq_len_text"},
-        "speech_input_ids": {0: "batch_size", 1: "seq_len_speech"},
-        "inputs_embeds": {0: "batch_size", 1: "sequence_length"}
-    },
-    # dynamo=True,
-)
-print(f"✅ Speech Encoder ONNX export is completed. Model saved as 'speech_encoder.onnx'")
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
 
-ref_wav = torch.empty((1, 1000)).uniform_(-0.97619647, 0.93708616)
+        wv, qk, fsm_memory = self.qkv_attention(q, k, v, mask, mask_pad,
+                                                cos, sin)
+        return self.out(wv) + fsm_memory, qk
 
-# 2. Export Feature Extractor
-class FeatureExtractor(nn.Module):
+
+class ResidualAttentionBlock(nn.Module):
+
+    def __init__(
+        self,
+        n_state: int,
+        n_head: int,
+        kernel_size: int = 31,
+        use_sdpa: bool = False,
+    ):
+        super().__init__()
+
+        self.attn = FSMNMultiHeadAttention(n_state,
+                                           n_head,
+                                           kernel_size,
+                                           use_sdpa=use_sdpa)
+        self.attn_ln = LayerNorm(n_state, eps=1e-6)
+
+        n_mlp = n_state * 4
+
+        self.mlp = nn.Sequential(Linear(n_state, n_mlp), nn.GELU(),
+                                       Linear(n_mlp, n_state))
+        self.mlp_ln = LayerNorm(n_state)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        mask_pad: Optional[torch.Tensor] = None,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+    ):
+        x = x + self.attn(
+            self.attn_ln(x), mask=mask, mask_pad=mask_pad,
+            cos=cos, sin=sin)[0]
+
+        x = x + self.mlp(self.mlp_ln(x))
+        return x
+
+
+class AudioEncoderV2(nn.Module):
+
+    def __init__(
+        self,
+        n_mels: int,
+        n_state: int,
+        n_head: int,
+        n_layer: int,
+        stride: int,
+        use_sdpa: bool,
+    ):
+        super().__init__()
+        self.stride = stride
+
+        self.conv1 = Conv1d(n_mels,
+                            n_state,
+                            kernel_size=3,
+                            stride=stride,
+                            padding=1)
+        self.conv2 = Conv1d(n_state,
+                            n_state,
+                            kernel_size=3,
+                            stride=2,
+                            padding=1)
+        cos, sin = precompute_freqs_cis(64, 1024 * 2)
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
+
+        self.blocks = nn.ModuleList([
+            ResidualAttentionBlock(n_state, n_head, use_sdpa=use_sdpa)
+            for _ in range(n_layer)
+        ])
+
+    def forward(self, x: torch.Tensor,
+                x_len: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x : torch.Tensor, shape = (batch_size, n_mels, T)
+            the mel spectrogram of the audio
+        x_len: torch.Tensor, shape = (batch_size,)
+            length of each audio in x
+        """
+        mask = make_non_pad_mask(x_len).unsqueeze(1)
+        x = F.gelu(self.conv1(x * mask))
+        x_len = (x_len + 2 - 1 * (3 - 1) - 1) // self.stride + 1
+        mask = make_non_pad_mask(x_len).unsqueeze(1)
+        x = F.gelu(self.conv2(x * mask))
+        x_len = (x_len + 2 - 1 * (3 - 1) - 1) // 2 + 1
+        mask = make_non_pad_mask(x_len).unsqueeze(1)
+        x = x.permute(0, 2, 1)  # (B, T // 2, n_state)
+        # NOTE: .contiguous() is essential for dynamo export!
+        x = x.contiguous()
+
+        
+        cos = self.cos[:x.size(1)].to(x.device)
+        sin = self.sin[:x.size(1)].to(x.device)
+
+        mask_pad = mask.transpose(1, 2)
+        mask = mask_to_bias(mask, x.dtype).unsqueeze(1)
+
+        for block in self.blocks:
+            x = block(x, mask, mask_pad, cos, sin)
+
+        return x, x_len
+
+
+class S3TokenizerV2(nn.Module):
+    """S3 tokenizer v2 implementation (inference-only).
+    Args:
+        config (ModelConfig): Config
+    """
+
     def __init__(self):
         super().__init__()
+        # self.name = name  # Store model name for token_rate determination
+        self.config = ModelConfig()
+        self.encoder = AudioEncoderV2(
+            self.config.n_mels,
+            self.config.n_audio_state,
+            self.config.n_audio_head,
+            self.config.n_audio_layer,
+            2,
+            self.config.use_sdpa,
+        )
+        self.quantizer = FSQVectorQuantization(
+            self.config.n_audio_state,
+            self.config.n_codebook_size,
+        )
+
+    def forward(self, mel: torch.Tensor,
+                mel_len: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.quantize(mel, mel_len)
+
+    @torch.inference_mode()
+    def quantize(self, mel: torch.Tensor,
+                 mel_len: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Quantize mel spectrogram to tokens, with automatic long audio handling.
+
+        Args:
+            mel: mel spectrogram tensor, shape (batch_size, n_mels, T)
+            mel_len: mel length tensor, shape (batch_size,)
+
+        Returns:
+            code: quantized tokens, shape (batch_size, T')
+            code_len: token length, shape (batch_size,)
+        """
+        # Check if any audio in the batch exceeds 30 seconds
+        # Assuming 16kHz sample rate and hop_length=160, 30s = 30*16000/160 = 3000 frames
+        # max_frames = 3000
+
+        # Check which samples are long audio
+        # assert (mel_len <= max_frames).all()
+
+        # All short audio - use original method
+        hidden, code_len = self.encoder(mel, mel_len)
+        code = self.quantizer.encode(hidden).long()
+        return code, code_len
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def freeze(self):
+        for _, param in self.named_parameters():
+            param.requires_grad = False
+
+
+class S3Tokenizer(S3TokenizerV2):
+    """
+    s3tokenizer.S3TokenizerV2 with the following changes:
+    - a more integrated `forward`
+    - compute `log_mel_spectrogram` using `_mel_filters` and `window` in `register_buffers`
+    """
+
+    ignore_state_dict_missing = ("_mel_filters", "window")
+
+    def __init__(
+        self,
+        config: ModelConfig = ModelConfig()
+    ):
+        super().__init__()
+
+        self.n_fft = 400
+        _mel_filters = librosa.filters.mel(
+            sr=S3_SR,
+            n_fft=self.n_fft,
+            n_mels=config.n_mels
+        )
+        self.register_buffer(
+            "_mel_filters",
+            torch.FloatTensor(_mel_filters),
+        )
+
+        self.register_buffer(
+            "window",
+            torch.hann_window(self.n_fft),
+        )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        wavs: torch.Tensor,
+        max_len,
+    ) -> torch.Tensor:
+        """
+        NOTE: mel-spec has a hop size of 160 points (100 frame/sec).
+
+        Args
+        ----
+        - `wavs`: 16 kHz speech audio
+        """
+        mels = self.log_mel_spectrogram(wavs)  # [B, F, T]
+        if max_len is not None:
+            mels = mels[..., :max_len * 4]
+        mel_lens = torch.full((mels.shape[0],), mels.shape[-1], dtype=torch.int32, device=self.device)
+
+        speech_tokens, _ = self.quantize(mels, mel_lens)
+        return speech_tokens
+
+    def log_mel_spectrogram(
+        self,
+        audio: torch.Tensor,
+        padding: int = 0,
+    ):
+        """
+        Compute the log-Mel spectrogram of
+
+        Parameters
+        ----------
+        audio: torch.Tensor, shape = (*)
+            The path to audio or either a NumPy array or Tensor containing the
+            audio waveform in 16 kHz
+
+        padding: int
+            Number of zero samples to pad to the right
+
+        Returns
+        -------
+        torch.Tensor, shape = (128, n_frames)
+            A Tensor that contains the Mel spectrogram
+        """
+
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+
+        audio = audio.to(self.device)
+        if padding > 0:
+            audio = F.pad(audio, (0, padding))
+        stft = torch.stft(
+            audio, self.n_fft, S3_HOP,
+            window=self.window.to(self.device),
+            return_complex=False
+        )
+        # remove Nyquist bin
+        stft = stft[..., :-1, :]
+        # compute magnitude squared
+        magnitudes = stft[..., 0]**2 + stft[..., 1]**2
+
+        mel_spec = self._mel_filters.to(self.device) @ magnitudes
+
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        return log_spec
+
+
+class SafeDenseLayer(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, bias=False):
+        super(SafeDenseLayer, self).__init__()
+        self.linear = torch.nn.Conv1d(in_channels, out_channels, 1, bias=bias)
+        self.nonlinear = torch.nn.Sequential()
+        self.nonlinear.add_module("layernorm", torch.nn.LayerNorm(out_channels))
+
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(-1)
+        x = self.linear(x)
+        if x.size(-1) == 1:
+            x = x[:, :, 0]
+        x = self.nonlinear(x)
+        return x
+
+
+class PrepareConditionalsModel(torch.nn.Module):
+
+    speech_cond_prompt_len = 150
+    speaker_embed_size = 256
+
+    def __init__(self, chatterbox):
+        super().__init__()
+
+        # TODO: Move loading elsewhere
+        self.s3 = S3Tokenizer()
+        self.s3.load_state_dict(chatterbox.s3gen.tokenizer.state_dict(), strict=False)
+
+        self.speaker_encoder = chatterbox.s3gen.speaker_encoder
+        self.flow = chatterbox.s3gen.flow
+
+        self.cond_enc = chatterbox.t3.cond_enc
+
         self.resampler = ta.transforms.Resample(S3GEN_SR, S3_SR)
         self.eps = torch.tensor(torch.finfo(torch.float).eps)
         self.n_fft = 400
@@ -264,17 +635,26 @@ class FeatureExtractor(nn.Module):
             "window",
             torch.hann_window(self.n_fft),
         )
+
+        self.speech_emb = chatterbox.t3.speech_emb
+        self.speech_pos_emb = chatterbox.t3.speech_pos_emb
     
+
+        # Speaker embedding projection
+        # NOTE: From testing, randomly/zero initializing speaker embedding seems to work fine
+        # speaker_emb = torch.randn(batch_size, self.speaker_embed_size)
+        speaker_emb = torch.zeros(1, self.speaker_embed_size)
+        self.cond_spkr = self.cond_enc.spkr_enc(speaker_emb.view(-1, self.speaker_embed_size))[:, None]  # (B, 1, dim)
+
     def mel_spectrogram(self, y, n_fft=1920, num_mels=80, sampling_rate=24000, hop_size=480, win_size=1920,
                     fmin=0, fmax=8000, center=False):
-        """Copied from https://github.com/shivammehta25/Matcha-TTS/blob/main/matcha/utils/audio.py
-        Set default values according to Cosyvoice's config.
-        """
-        y = torch.nn.functional.pad(
-            y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
+        y = F.pad(
+            y.unsqueeze(1),
+            ((n_fft - hop_size) // 2, (n_fft - hop_size) // 2),
+            mode="reflect",
         )
         y = y.squeeze(1)
-        hann_window = torch.hann_window(1920)
+        hann_window = torch.hann_window(win_size)
         mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
         mel = torch.from_numpy(mel).float()
         spec = torch.stft(
@@ -289,11 +669,13 @@ class FeatureExtractor(nn.Module):
             onesided=True,
             return_complex=False,
         )
-        real = spec[..., 0]
-        imag = spec[..., 1]
-        spec = torch.sqrt(real**2 + imag**2 + 1e-9)
+        # real = spec[..., 0]
+        # imag = spec[..., 1]
+        # spec = torch.sqrt(real**2 + imag**2 + 1e-9)
+        spec = torch.sqrt(spec.pow(2).sum(-1) + (1e-9))
+
         spec = torch.matmul(mel, spec)
-        spec = torch.log(torch.clamp(spec, min=1e-5) * 1)
+        spec = torch.log(torch.clamp(spec, min=1e-5) * 1) # spectral_normalize_torch
 
         return spec
     
@@ -358,7 +740,7 @@ class FeatureExtractor(nn.Module):
 
         if preemphasis_coefficient != 0.0:
             # strided_input[i,j] -= preemphasis_coefficient * strided_input[i, max(0, j-1)] for all i,j
-            offset_strided_input = torch.nn.functional.pad(strided_input.unsqueeze(0), (1, 0), mode="replicate").squeeze(
+            offset_strided_input = F.pad(strided_input.unsqueeze(0), (1, 0), mode="replicate").squeeze(
                 0
             )  # size (m, window_size + 1)
             strided_input = strided_input - preemphasis_coefficient * offset_strided_input[:, :-1]
@@ -370,7 +752,7 @@ class FeatureExtractor(nn.Module):
         # Pad columns with zero until we reach size (m, padded_window_size)
         if padded_window_size != window_size:
             padding_right = padded_window_size - window_size
-            strided_input = torch.nn.functional.pad(
+            strided_input = F.pad(
                 strided_input.unsqueeze(0), (0, padding_right), mode="constant", value=0
             ).squeeze(0)
 
@@ -441,7 +823,7 @@ class FeatureExtractor(nn.Module):
         mel_energies = mel_energies.to(device=device, dtype=dtype)
 
         # pad right column with zeros and add dimension, size (num_mel_bins, padded_window_size // 2 + 1)
-        mel_energies = torch.nn.functional.pad(mel_energies, (0, 1), mode="constant", value=0)
+        mel_energies = F.pad(mel_energies, (0, 1), mode="constant", value=0)
 
         # sum with mel fiterbanks over the power spectrum, size (m, num_mel_bins)
         mel_energies = torch.matmul(spectrum, mel_energies.T)
@@ -450,180 +832,116 @@ class FeatureExtractor(nn.Module):
         mel_energies = torch.max(mel_energies, self.eps).log()
         return mel_energies
 
-    def log_mel_spectrogram(
+    def forward(
         self,
-        audio: torch.Tensor
+        audio_values: torch.Tensor, # NOTE: Must have sample rate of S3GEN_SR=24000
+        exaggeration: float = 0.5,
     ):
-        """
-        Compute the log-Mel spectrogram of
+        batch_size = audio_values.shape[0]
 
-        Parameters
-        ----------
-        audio: torch.Tensor, shape = (*)
-            The path to audio or either a NumPy array or Tensor containing the
-            audio waveform in 16 kHz
+        # Compute embed_ref
+        ref_wav_24 = audio_values[..., :DEC_COND_LEN]
+        prompt_feat = self.mel_spectrogram(ref_wav_24).transpose(1, 2)
 
-        padding: int
-            Number of zero samples to pad to the right
+        # Resample to 16kHz
+        ref_wav_16 = self.resampler(audio_values) # resample uncropped audio
 
-        Returns
-        -------
-        torch.Tensor, shape = (128, n_frames)
-            A Tensor that contains the Mel spectrogram
-        """
-        stft = torch.stft(
-            audio, self.n_fft, S3_HOP,
-            window=self.window,
-            return_complex=False
-        )
-        real = stft[..., 0]
-        imag = stft[..., 1]
-        magnitudes = real.pow(2) + imag.pow(2)
+        # Speech cond prompt tokens
+        # TODO START REMOVE
+        # -- AT EXPORT, WE MUST SWAP THIS WITH self.resampler(audio_values)
+        # ref_wav_16 = librosa.resample(audio_values.cpu().numpy(), orig_sr=S3GEN_SR, target_sr=S3_SR)
+        # ref_wav_16 = torch.from_numpy(ref_wav_16).to(audio_values.device)
+        # TODO END REMOVE
 
-        mel_spec = self.mel_filters @ magnitudes
-
-        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-        log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
-        log_spec = (log_spec + 4.0) / 4.0
-        return log_spec
-
-    def forward(self, ref_wav):
-        ref_wav_24 = ref_wav
-        ref_mels_24 = self.mel_spectrogram(ref_wav_24).transpose(1, 2)
-        ref_wav_16 = self.resampler(ref_wav)
-        feature = self.extract_feature(ref_wav_16, num_mel_bins=80)
+        feature = self.extract_feature(ref_wav_16, num_mel_bins=80) # == Kaldi.fbank(ref_wav_16, num_mel_bins=80)
         feature = feature - feature.mean(dim=0, keepdim=True)
-        ref_wav_16 = self.log_mel_spectrogram(ref_wav_16)
-        return feature, ref_mels_24, ref_wav_16
+        ref_x_vector = self.speaker_encoder(feature.unsqueeze(0))
 
-feature_extractor = FeatureExtractor()
-feature, ref_mels_24, ref_wav_16 = feature_extractor(ref_wav)
-torch.onnx.export(
-    feature_extractor,
-    (ref_wav),
-    f"{output_dir}/feature_extractor.onnx",
-    export_params=True,
-    opset_version=17,
-    input_names=["ref_wav"],
-    output_names=["feature", "ref_mels_24", "ref_wav_16"],
-    dynamic_axes={
-        "ref_wav": {1: "sequence_length"},
-        "feature": {0: "batch_size", 1: "feature_dim"},
-        "ref_mels_24": {0: "batch_size", 1: "time", 2: "feature_dim"},
-        "ref_mels_16": {0: "batch_size", 1: "number_of_mels", 2: "number_of_frames"},
-    },
-)
-print(f"✅ Feature Extractor ONNX export is completed. Model saved as 'feature_extractor.onnx'")
+        t3_cond_prompt_tokens = self.s3(ref_wav_16[..., :ENC_COND_LEN], max_len=self.speech_cond_prompt_len)
 
-#3. Export speech encoder
-class SpeakerEncoderWrapper(nn.Module):
-    def __init__(self):
+        resampled_wav_16 = self.resampler(ref_wav_24) # resample uncropped audio
+
+        # NOTE: For some reason, we do two passes of the s3 tokenizer
+        # TODO: Try reduce this?
+        # Tokenize 16khz reference
+        prompt_token = self.s3(resampled_wav_16, max_len=None)
+
+        cond_prompt_speech_emb = self.speech_emb(t3_cond_prompt_tokens) + \
+                     self.speech_pos_emb(t3_cond_prompt_tokens)
+
+        # Cond prompt
+        cond_prompt_speech_emb = self.cond_enc.perceiver(cond_prompt_speech_emb)
+
+        # Emotion Adv: must provide a value if this model uses emotion conditioning
+        emotion_adv=torch.full((batch_size, 1, 1), exaggeration)
+        cond_emotion_adv = self.cond_enc.emotion_adv_fc(emotion_adv)
+
+        expanded_cond_spkr = self.cond_spkr.expand(batch_size, -1, -1)  # (B, 1, dim)
+
+        # Concat and return
+        cond_emb = torch.cat((
+            expanded_cond_spkr,
+            cond_prompt_speech_emb,
+            cond_emotion_adv,
+        ), dim=1)  # (B, len_cond, dim)
+        # assert cond_emb.dim() == 3
+
+        return cond_emb, prompt_token, ref_x_vector, prompt_feat
+
+
+class InputsEmbeds(nn.Module):
+    def __init__(self, chatterbox):
         super().__init__()
-        self.speaker_encoder = model.s3gen.speaker_encoder
-    
-    def forward(self, feature):
-        embedding = self.speaker_encoder(feature)
-        return embedding
+        self.text_emb = chatterbox.t3.text_emb
+        self.text_pos_emb = chatterbox.t3.text_pos_emb.emb
 
-padded_feature = pad_list([feature], 0)
-speaker_embd_wrapper = SpeakerEncoderWrapper()
-torch.onnx.export(
-    speaker_embd_wrapper,
-    (padded_feature),
-    f"{output_dir}/speaker_emb.onnx",
-    export_params=True,
-    opset_version=14,
-    input_names=["feature"],
-    output_names=["embedding"],
-    dynamic_axes={
-        "feature": {0: "batch_size", 0: "embedding_size", 1: "feature_dim"},
-        "embedding": {1: "embedding_length"},
-    },
-)
-print(f"✅ Speaker embedding reference ONNX export is completed. Model saved as 'speaker_emb.onnx'")
+        self.speech_emb = chatterbox.t3.speech_emb
+        self.speech_pos_emb = chatterbox.t3.speech_pos_emb.emb
 
-# input('wait...')
-batch_size, seq_len, _ = inputs_embeds.shape
-num_layers = 30
-num_key_value_heads = 16
-head_dim = 64
-attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
-dummy_past_key_values_kwargs = {
-    f"past_key_values_{i}_{key}": torch.empty(
-        batch_size, num_key_value_heads, seq_len, head_dim, dtype=torch.float32,
-    )
-    for i in range(num_layers)
-    for key in ["key", "value"]
-}
-dynamic_axes = {
-    "inputs_embeds": {0: "batch_size", 1: "seq_len"},
-    "attention_mask": {0: "batch_size", 1: "seq_len"},
-    "position_ids": {0: "batch_size", 1: "seq_len"}
-}
-pkv_input_names = list(dummy_past_key_values_kwargs.keys())
-pkv_output_names = list(
-    x.replace("past_key_values", "present") for x in dummy_past_key_values_kwargs.keys()
-)
-for name in pkv_input_names:
-    dynamic_axes[name] = {0: "batch_size", 2: "past_seq_len"}
-position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
-onnx_inputs = (inputs_embeds, *dummy_past_key_values_kwargs.values())
-next_token = torch.full((batch_size, 1), 6563, dtype=torch.long)
-idx = torch.tensor([0])
+    def forward(self, input_ids, position_ids):
+        assert position_ids.shape == input_ids.shape
+        batch, seq_len = input_ids.shape
 
-# 4. Export speech embedding
-class SpeechEmbedding(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.speech_emb = model.t3.speech_emb
-        self.speech_pos_emb = model.t3.speech_pos_emb
-    
-    def forward(self, next_token, idx):
-        next_token_embed = model.t3.speech_emb(next_token)
-        next_token_embed = next_token_embed + model.t3.speech_pos_emb.get_fixed_embedding(idx + 1)
-        return next_token_embed
-    
-speech_embedding = SpeechEmbedding()
-torch.onnx.export(
-    speech_embedding,
-    (next_token, idx),
-    f"{output_dir}/speech_embedding.onnx",
-    export_params=True,
-    opset_version=14,
-    input_names=["next_token", "idx"],
-    output_names=["next_token_embed"],
-    dynamic_axes={
-        "next_token": {0: "batch_size"},
-    },
-)
-print(f"✅ Speech embedding ONNX export is completed. Model saved as 'speech_embedding.onnx'")
+        x = input_ids
+        idx = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch, -1)
+        
+        # Detect first zero
+        is_zero = (x == 0)
+        has_zero = is_zero.any(dim=1)
+        zero_pos = torch.where(
+            has_zero,
+            is_zero.float().argmax(dim=1),
+            torch.full((batch,), -1, device=x.device)  # placeholder
+        )
 
-# 5. Export LLM Backbone (Llama3 from repo vladislavbro/llama_backbone_0.5) using https://github.com/microsoft/onnxruntime-genai/blob/main/src/python/py/models/builder.py
-# Before export, we replace embed_tokens nd lm_head of the LLM backbone model
-# because it does not specifically use LLM tokens
+        # Masks
+        text_mask = (idx <= zero_pos.unsqueeze(1)) & has_zero.unsqueeze(1)
+        speech_mask = ~text_mask
 
-# new_model = LlamaForCausalLM(config)
-# new_model.model.load_state_dict(model.t3.tfmr.state_dict(), strict=True)
-# new_model.config.vocab_size = model.t3.speech_head.out_features
-# new_model.vocab_size = new_model.config.vocab_size
-# new_model.model.embed_tokens = nn.Embedding(new_model.vocab_size, new_model.config.hidden_size)
-# new_model.model.embed_tokens.weight.data.copy_(model.t3.speech_head.weight.data)
-# new_model.lm_head = model.t3.speech_head
-# new_model.tie_weights()
+        # Compute relative positions by multiplying with the masks
+        text_pos_ids = position_ids * text_mask
+        speech_pos_ids = position_ids * speech_mask
 
-# new_model.push_to_hub("vladislavbro/llama_backbone_0.5", revision="refs/pr/1")
+        # Flatten
+        flat_x = x.view(-1)
+        flat_text_mask = text_mask.view(-1)
+        flat_speech_mask = speech_mask.view(-1)
+        flat_text_pos = text_pos_ids.view(-1)[flat_text_mask]
+        flat_speech_pos = speech_pos_ids.view(-1)[flat_speech_mask]
 
-hidden_states = torch.randn(1, text_tokens_ids.shape[1], config.n_channels)
-head_out = model.t3.speech_head(hidden_states)
+        # Embed
+        text_emb = self.text_emb(flat_x[flat_text_mask]) + self.text_pos_emb(flat_text_pos)
+        speech_emb = self.speech_emb(flat_x[flat_speech_mask]) + self.speech_pos_emb(flat_speech_pos)
 
-speech_tokens = torch.randint(
-        0, config.text_tokens_dict_size, (1, head_out.shape[1])
-    )
-speech_token_lens = torch.LongTensor([speech_tokens.size(1)])
-speech_tokens, token_len = torch.concat([model.conds.gen["prompt_token"], speech_tokens], dim=1), model.conds.gen["prompt_token_len"] + speech_token_lens
-mask = (~make_pad_mask(token_len).unsqueeze(-1)).to(speech_tokens)
-embedding = model.conds.gen["embedding"]
-prompt_feat = model.conds.gen["prompt_feat"]
+        # Scatter back
+        embed_dim = text_emb.size(-1)
+        out = torch.zeros(batch * seq_len, embed_dim, device=x.device)
+        out[flat_text_mask] = text_emb
+        out[flat_speech_mask] = speech_emb
+        out = out.view(batch, seq_len, embed_dim)
+
+        return out
+
 
 class ISTFT(torch.nn.Module):
     def __init__(self, n_fft: int, hop_length: int, win_length: int):
@@ -645,6 +963,7 @@ class ISTFT(torch.nn.Module):
 
 
         self.window = torch.hann_window(win_length)
+
         # Center pad the window to the size of n_fft
         pad_length = n_fft - self.window.size(0)
         pad_left = pad_length // 2
@@ -729,9 +1048,74 @@ class ISTFT(torch.nn.Module):
 
 istft = ISTFT(ISTFT_PARAMS["n_fft"], ISTFT_PARAMS["hop_len"], ISTFT_PARAMS["n_fft"])
 
-#6. Export Conditional Decoder
+
+def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
+    """Make mask tensor containing indices of padded part.
+
+    See description of make_non_pad_mask.
+
+    Args:
+        lengths (torch.Tensor): Batch of lengths (B,).
+    Returns:
+        torch.Tensor: Mask tensor containing indices of padded part.
+
+    Examples:
+        >>> lengths = [5, 3, 2]
+        >>> make_pad_mask(lengths)
+        masks = [[0, 0, 0, 0 ,0],
+                    [0, 0, 0, 1, 1],
+                    [0, 0, 1, 1, 1]]
+    """
+    batch_size = lengths.size(0)
+    max_len = max_len if max_len > 0 else lengths.max().item()
+    seq_range = torch.arange(0,
+                            max_len,
+                            dtype=torch.int64,
+                            device=lengths.device)
+    seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
+    seq_length_expand = lengths.unsqueeze(-1)
+    mask = seq_range_expand >= seq_length_expand
+    return mask
+
+def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    assert mask.dtype == torch.bool
+    assert dtype in [torch.float32, torch.bfloat16, torch.float16]
+    mask = mask.to(dtype)
+    mask = (1.0 - mask) * -1.0e+10
+    return mask
+
+def pad_list(xs, pad_value):
+    """Perform padding for the list of tensors.
+
+    Args:
+        xs (List): List of Tensors [(T_1, `*`), (T_2, `*`), ..., (T_B, `*`)].
+        pad_value (float): Value for padding.
+
+    Returns:
+        Tensor: Padded tensor (B, Tmax, `*`).
+
+    Examples:
+        >>> x = [torch.ones(4), torch.ones(2), torch.ones(1)]
+        >>> x
+        [tensor([1., 1., 1., 1.]), tensor([1., 1.]), tensor([1.])]
+        >>> pad_list(x, 0)
+        tensor([[1., 1., 1., 1.],
+                [1., 1., 0., 0.],
+                [1., 0., 0., 0.]])
+
+    """
+    n_batch = len(xs)
+    max_len = max(x.size(0) for x in xs)
+    pad = xs[0].new(n_batch, max_len, *xs[0].size()[1:]).fill_(pad_value)
+
+    for i in range(n_batch):
+        pad[i, : xs[i].size(0)] = xs[i]
+
+    return pad
+
+
 class ConditionalDecoder(nn.Module):
-    def __init__(self):
+    def __init__(self, model):
         super().__init__()
         self.output_size = model.s3gen.flow.output_size
         self.input_embedding = model.s3gen.flow.input_embedding
@@ -935,7 +1319,7 @@ class ConditionalDecoder(nn.Module):
         cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0)
 
         ## Classifier-Free Guidance inference introduced in VoiceBox
-        #step 1
+        # step 1
         dphi_dt = self.cond_forward(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
         dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
         dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
@@ -1095,41 +1479,180 @@ class ConditionalDecoder(nn.Module):
         output_wavs[:, :trim_fade.size(0)] *= trim_fade
         return output_wavs
 
-cond_decoder = ConditionalDecoder()
-torch.onnx.export(
-    cond_decoder,
-    (speech_tokens, token_len, embedding, prompt_feat),
-    f"{output_dir}/conditional_decoder.onnx",
-    export_params=True,
-    opset_version=17,
-    input_names=["speech_tokens", "token_len", "embedding", "prompt_feat"],
-    output_names=["output_wavs"],
-    dynamic_axes={
-        "speech_tokens": {
-            0: "batch_size",
-            1: "feature_dim"
-        },
 
-        "token_len": {
-            0: "sequence_len"
-        },
+@torch.no_grad()
+def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=False, output_dir=None, output_file_name="output.wav"):
+    from chatterbox.tts import ChatterboxTTS
+    if output_dir:
+        import os
+        os.makedirs(output_dir, exist_ok=True)
 
-        "embedding": {
-            0: "batch_size", 
-            1: "feature_dim",
-        },
+    chatterbox_model = ChatterboxTTS.from_pretrained(device="cpu")
 
-        "prompt_feat": {
-            0: "batch_size", 
-            1: "feature_dim",
-        },
-        "output_wavs": {0: 'batch_size', 1: 'length'},
-    }
-)
-print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'conditional_decoder.onnx'")
+    # replace DenseLayer of speake_encoder on custom SafeDenseLayer with exchanging BatchNorm1d layer on LayerNorm for ONNX export compatibility
+    # we can safely do that because it does not affect inference as we do no need matching training dynamics
+    # TODO Probably move this logic somewhere else outside export script
+    old_dense = chatterbox_model.s3gen.speaker_encoder.xvector.dense
+    chatterbox_model.s3gen.speaker_encoder.xvector.dense = SafeDenseLayer(old_dense.linear.in_channels, old_dense.linear.out_channels)
+    chatterbox_model.s3gen.speaker_encoder.xvector.dense.linear.weight.copy_(old_dense.linear.weight)
 
-#7. Post-processing
-for f in os.listdir(output_dir):
-    p = os.path.join(output_dir, f)
-    onnxslim.slim(p, p)
-print("Chatterbox model export successfully completed")
+    prepare_conditionals = PrepareConditionalsModel(chatterbox_model).eval()
+    embed_tokens = InputsEmbeds(chatterbox_model).eval()
+    cond_decoder = ConditionalDecoder(chatterbox_model).eval()
+
+    AUDIO_PROMPT_PATH = "back_4_more_fun.wav"
+    # For testing:
+    # chatterbox_model.prepare_conditionals(AUDIO_PROMPT_PATH, exaggeration=2)
+
+    audio_values, _sr = librosa.load(AUDIO_PROMPT_PATH, sr=S3GEN_SR)
+    audio_values = torch.from_numpy(audio_values).unsqueeze(0)
+
+    start_speech_token = 6561
+    stop_speech_token = 6562
+
+    input_ids=torch.tensor([[255, 281,  39,  46,  56,   2,  53,   2, 286,  41,  37,   2, 136, 122,
+          49,   2, 152,   2, 103,   2, 277,  21, 101,   7,   2, 301,  55,  34,
+          28,   7,   2,  53,   2, 296,  18,  18, 115,   2,  51,   2,  33, 245,
+           2,  17, 190,   2,  42,   2,  50,  18, 125,   4,  32,   2, 290, 169,
+         142,   2,  41,   2,  43,   2,  18,  29,  91,   2,  25, 186,   8,  20,
+          14,  80,   2,  29,  86, 213, 216,   9,   0, start_speech_token, start_speech_token]])
+    
+    # NOTE: For some reason, the original implementation appends two speech tokens at the end
+    # This is most likely by accident, but we keep it for compatibility
+    position_ids = torch.where(
+        input_ids == start_speech_token,
+        0,
+        torch.arange(input_ids.shape[1]).unsqueeze(0)
+    )
+
+    exaggeration = torch.tensor(0.5)
+
+    if export_prepare_conditions:
+        torch.onnx.export(
+            embed_tokens,
+            (input_ids, position_ids),
+            f"{output_dir}/embed_tokens.onnx",
+            export_params=True,
+            opset_version=20,
+            input_names=["input_ids", "position_ids"],
+            output_names=["inputs_embeds"],
+            dynamic_axes={
+                "input_ids": {0: "batch_size", 1: "sequence_length"},
+                "position_ids": {0: "batch_size", 1: "sequence_length"},
+                "inputs_embeds": {0: "batch_size", 1: "sequence_length"},
+            },
+        )
+        print(f"✅ Embedding Tokens ONNX export is completed. Model saved as 'embed_tokens.onnx'")
+
+        dummy_audio_values = torch.randn(1, 312936)
+        torch.onnx.export(
+            prepare_conditionals,
+            (dummy_audio_values, exaggeration),
+            f"{output_dir}/speech_encoder.onnx",
+            export_params=True,
+            opset_version=20,
+            input_names=["audio_values", "exaggeration"],
+            output_names=["audio_features", "audio_tokens", "speaker_embedding", "spectrogram"],
+            dynamic_axes={
+                "audio_values": {0: "batch_size", 1: "num_samples"},
+                "exaggeration": {},
+                "audio_features": {0: "batch_size", 1: "sequence_length"},
+                "audio_tokens": {0: "batch_size", 1: "audio_sequence_length"},
+                "speaker_embedding": {0: "batch_size"}, # , 1: "speaker_embedding_length"
+                "spectrogram": {0: "batch_size"},
+            },
+        )
+        print(f"✅ Speech Encoder ONNX export is completed. Model saved as 'speech_encoder.onnx'")
+
+
+    # Example run
+    cond_emb, prompt_token, ref_x_vector, prompt_feat = prepare_conditionals(audio_values=audio_values, exaggeration=exaggeration)
+
+    text_emb = embed_tokens(input_ids=input_ids, position_ids=position_ids)
+
+    inputs_embeds = torch.cat((cond_emb, text_emb), dim=1) # (B, length, dim)
+
+    from transformers import LlamaForCausalLM, RepetitionPenaltyLogitsProcessor
+    llm = LlamaForCausalLM.from_pretrained("vladislavbro/llama_backbone_0.5")
+    llm.eval()
+
+    repetition_penalty = 1.2
+    repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
+
+    generate_tokens = torch.tensor([[start_speech_token]], dtype=torch.long)
+    max_new_tokens = 256
+    past_key_values = None
+    for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
+        single_pass = llm(
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+        )
+        past_key_values = single_pass.past_key_values
+        next_token_logits = single_pass.logits[:, -1, :]
+
+        next_token_logits = repetition_penalty_processor(generate_tokens, next_token_logits)
+
+        next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+        generate_tokens = torch.cat((generate_tokens, next_token), dim=-1)
+        if (next_token.view(-1) == stop_speech_token).all():
+            break
+
+        # embed next token
+        position_ids = torch.full(
+            (input_ids.shape[0], 1),
+            i + 1,
+            dtype=torch.long,
+        )
+        next_token_emb = embed_tokens(next_token, position_ids)
+        inputs_embeds = next_token_emb
+
+    speech_tokens = torch.cat([prompt_token, generate_tokens[:, 1:-1]], dim=1)
+    token_len = torch.tensor([speech_tokens.shape[1]])
+    embedding = ref_x_vector
+
+    if export_cond_decoder:
+        torch.onnx.export(
+            cond_decoder,
+            (speech_tokens, token_len, embedding, prompt_feat),
+            f"{output_dir}/conditional_decoder.onnx",
+            export_params=True,
+            opset_version=17,
+            input_names=["speech_tokens", "token_len", "embedding", "prompt_feat"],
+            output_names=["output_wavs"],
+            dynamic_axes={
+                "speech_tokens": {
+                    0: "batch_size",
+                    1: "feature_dim"
+                },
+
+                "token_len": {
+                    0: "sequence_len"
+                },
+
+                "embedding": {
+                    0: "batch_size", 
+                    1: "feature_dim",
+                },
+
+                "prompt_feat": {
+                    0: "batch_size", 
+                    1: "feature_dim",
+                },
+                "output_wavs": {0: 'batch_size', 1: 'length'},
+            }
+        )
+        print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'conditional_decoder.onnx'")
+
+    output = cond_decoder(
+        speech_tokens=speech_tokens,
+        token_len=token_len,
+        embedding=embedding,
+        prompt_feat=prompt_feat,
+    )
+
+    ta.save(output_file_name, output, S3GEN_SR)
+    print(f"{output_file_name} was successfully saved")
+
+
+if __name__ == "__main__":
+    export_model_to_onnx()
