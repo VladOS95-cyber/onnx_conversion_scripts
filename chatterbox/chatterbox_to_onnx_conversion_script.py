@@ -1481,11 +1481,11 @@ class ConditionalDecoder(nn.Module):
 
 
 @torch.no_grad()
-def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=False, output_dir=None, output_file_name="output.wav"):
+def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=False, audio_prompt_path=None, output_export_dir=None, output_file_name="output.wav"):
     from chatterbox.tts import ChatterboxTTS
-    if output_dir:
+    if output_export_dir:
         import os
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(output_export_dir, exist_ok=True)
 
     chatterbox_model = ChatterboxTTS.from_pretrained(device="cpu")
 
@@ -1500,11 +1500,10 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
     embed_tokens = InputsEmbeds(chatterbox_model).eval()
     cond_decoder = ConditionalDecoder(chatterbox_model).eval()
 
-    AUDIO_PROMPT_PATH = "back_4_more_fun.wav"
     # For testing:
     # chatterbox_model.prepare_conditionals(AUDIO_PROMPT_PATH, exaggeration=2)
 
-    audio_values, _sr = librosa.load(AUDIO_PROMPT_PATH, sr=S3GEN_SR)
+    audio_values, _sr = librosa.load(audio_prompt_path, sr=S3GEN_SR)
     audio_values = torch.from_numpy(audio_values).unsqueeze(0)
 
     start_speech_token = 6561
@@ -1531,7 +1530,7 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
         torch.onnx.export(
             embed_tokens,
             (input_ids, position_ids),
-            f"{output_dir}/embed_tokens.onnx",
+            f"{output_export_dir}/embed_tokens.onnx",
             export_params=True,
             opset_version=20,
             input_names=["input_ids", "position_ids"],
@@ -1548,7 +1547,7 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
         torch.onnx.export(
             prepare_conditionals,
             (dummy_audio_values, exaggeration),
-            f"{output_dir}/speech_encoder.onnx",
+            f"{output_export_dir}/speech_encoder.onnx",
             export_params=True,
             opset_version=20,
             input_names=["audio_values", "exaggeration"],
@@ -1614,7 +1613,7 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
         torch.onnx.export(
             cond_decoder,
             (speech_tokens, token_len, embedding, prompt_feat),
-            f"{output_dir}/conditional_decoder.onnx",
+            f"{output_export_dir}/conditional_decoder.onnx",
             export_params=True,
             opset_version=17,
             input_names=["speech_tokens", "token_len", "embedding", "prompt_feat"],
