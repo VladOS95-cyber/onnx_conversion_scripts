@@ -1334,7 +1334,8 @@ class ConditionalDecoder(nn.Module):
 
         return magnitude, phase
 
-    def forward(self, speech_tokens, token_len, embedding, prompt_feat):
+    def forward(self, speech_tokens, embedding, prompt_feat):
+        token_len = torch.full((speech_tokens.size(0),), speech_tokens.size(1), dtype=torch.long, device=speech_tokens.device)
         mask = (~make_pad_mask(token_len)).unsqueeze(-1)
         mel_len1, mel_len2, mu, spks, cond = self.flow_forward(speech_tokens, token_len, mask, embedding, prompt_feat)
         mu = mu.transpose(1, 2).contiguous()
@@ -1642,26 +1643,21 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
         inputs_embeds = next_token_emb
 
     speech_tokens = torch.cat([prompt_token, generate_tokens[:, 1:-1]], dim=1)
-    token_len = torch.tensor([speech_tokens.shape[1]])
     embedding = ref_x_vector
 
     if export_cond_decoder:
         torch.onnx.export(
             cond_decoder,
-            (speech_tokens, token_len, embedding, prompt_feat),
+            (speech_tokens, embedding, prompt_feat),
             f"{output_export_dir}/conditional_decoder.onnx",
             export_params=True,
             opset_version=17,
-            input_names=["speech_tokens", "token_len", "embedding", "prompt_feat"],
+            input_names=["speech_tokens", "embedding", "prompt_feat"],
             output_names=["output_wavs"],
             dynamic_axes={
                 "speech_tokens": {
                     0: "batch_size",
                     1: "feature_dim"
-                },
-
-                "token_len": {
-                    0: "sequence_len"
                 },
 
                 "embedding": {
@@ -1678,9 +1674,14 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
         )
         print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'conditional_decoder.onnx'")
 
+    if export_prepare_conditions or export_cond_decoder:
+        import onnxslim
+        for f in os.listdir(output_export_dir):
+            p = os.path.join(output_export_dir, f)
+            onnxslim.slim(p, p)
+
     output = cond_decoder(
         speech_tokens=speech_tokens,
-        token_len=token_len,
         embedding=embedding,
         prompt_feat=prompt_feat,
     )
@@ -1692,7 +1693,7 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
 if __name__ == "__main__":
     AUDIO_PROMPT_PATH="path/to/audio.wav"
     export_model_to_onnx(
-        export_prepare_conditions=True,
+        export_prepare_conditions=False,
         export_cond_decoder=False,
         audio_prompt_path=AUDIO_PROMPT_PATH,
         output_export_dir="output_dir",

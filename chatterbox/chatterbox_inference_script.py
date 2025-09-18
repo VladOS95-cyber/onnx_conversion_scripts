@@ -1,14 +1,17 @@
 import onnxruntime
-import numpy as np
-from huggingface_hub import hf_hub_download
+
 import torchaudio as ta
 import torch
+import torch.nn.functional as F
+
+from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
 from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
+
+import numpy as np
 from tqdm import tqdm
 import perth
 import librosa
-from transformers import AutoTokenizer
-import torch.nn.functional as F
 
 SPACE = "[SPACE]"
 S3GEN_SR = 24000
@@ -134,13 +137,11 @@ def run_inference(
 
         speech_tokens = generate_tokens[:, 1:-1]
         speech_tokens = np.concatenate([prompt_token, speech_tokens], axis=1)
-        token_len = np.array([speech_tokens.shape[1]])
-        return speech_tokens, token_len, ref_x_vector, prompt_feat
+        return speech_tokens, ref_x_vector, prompt_feat
 
-    speech_tokens, token_len, ref_x_vector, prompt_feat = execute_text_to_audio_inference(text)
+    speech_tokens, ref_x_vector, prompt_feat = execute_text_to_audio_inference(text)
     cond_incoder_input = {
         "speech_tokens": speech_tokens,
-        "token_len": token_len,
         "embedding": ref_x_vector,
         "prompt_feat": prompt_feat,
     }
