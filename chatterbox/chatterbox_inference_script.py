@@ -18,13 +18,15 @@ S3GEN_SR = 24000
 # Sampling rate of the inputs to S3TokenizerV2
 S3_SR = 16_000
 DEC_COND_LEN = 10 * S3GEN_SR
-start_speech_token = 6561
-stop_speech_token = 6562
+EXAGGERATION_TOKEN = 6563
+START_SPEECH_TOKEN = 6561
+STOP_SPEECH_TOKEN = 6562
 
 def run_inference(
         text="The Lord of the Rings is the greatest work of literature.", 
         target_voice_path=None, 
-        max_new_tokens = 128, 
+        max_new_tokens = 128,
+        exaggeration=0.5, 
         output_dir="converted", 
         output_file_name="output.wav" ):
 
@@ -55,17 +57,19 @@ def run_inference(
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         text_tokens_ids = tokenizer(text)["input_ids"]
         text_tokens_ids = torch.IntTensor(text_tokens_ids).unsqueeze(0)
-        input_ids = F.pad(text_tokens_ids, (0, 1), value=start_speech_token)
-        input_ids = F.pad(input_ids, (0, 1), value=start_speech_token)
+        input_ids = F.pad(text_tokens_ids, (0, 1), value=START_SPEECH_TOKEN)
+        input_ids = F.pad(input_ids, (0, 1), value=START_SPEECH_TOKEN)
+        input_ids = F.pad(input_ids, (1, 0), value=EXAGGERATION_TOKEN)
         position_ids = torch.where(
-            input_ids == start_speech_token,
+            input_ids >= START_SPEECH_TOKEN,
             0,
-            torch.arange(input_ids.shape[1]).unsqueeze(0)
+            torch.arange(input_ids.shape[1]).unsqueeze(0) - 1
         )
 
         ort_embed_tokens_inputs = {
             "input_ids": input_ids.cpu().numpy().astype(np.int64),
             "position_ids": position_ids.cpu().numpy(),
+            "exaggeration": np.array([exaggeration], dtype=np.float32)
         }
 
         ## Instantiate the logits processors.
@@ -76,7 +80,7 @@ def run_inference(
         num_key_value_heads = 16
         head_dim = 64
 
-        generate_tokens = torch.tensor([[start_speech_token]], dtype=torch.long)
+        generate_tokens = torch.tensor([[START_SPEECH_TOKEN]], dtype=torch.long)
 
         # ---- Generation Loop using kv_cache ----
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
@@ -85,7 +89,6 @@ def run_inference(
             if i == 0:
                 ort_speech_encoder_input = {
                     "audio_values": audio_values.detach().cpu().numpy().astype(np.float32),
-                    "exaggeration": np.array(0.5, dtype=np.float32)
                 }
                 cond_emb, prompt_token, ref_x_vector, prompt_feat = speech_encoder_session.run(None, ort_speech_encoder_input)
                 inputs_embeds = np.concat((cond_emb, inputs_embeds), axis=1)
@@ -114,7 +117,7 @@ def run_inference(
 
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
             generate_tokens = torch.cat((generate_tokens, next_token), dim=-1)
-            if (next_token.view(-1) == stop_speech_token).all():
+            if (next_token.view(-1) == STOP_SPEECH_TOKEN).all():
                 break
 
             # Get embedding for the new token.
