@@ -11,9 +11,6 @@ from transformers import AutoTokenizer
 import torch.nn.functional as F
 
 SPACE = "[SPACE]"
-SPEECH_VOCAB_SIZE = 6561
-SOS = SPEECH_VOCAB_SIZE
-EOS = SPEECH_VOCAB_SIZE + 1
 S3GEN_SR = 24000
 # Sampling rate of the inputs to S3TokenizerV2
 S3_SR = 16_000
