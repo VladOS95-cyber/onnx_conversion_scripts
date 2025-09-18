@@ -13,8 +13,6 @@ import torch.nn.functional as F
 SPACE = "[SPACE]"
 S3GEN_SR = 24000
 # Sampling rate of the inputs to S3TokenizerV2
-S3_SR = 16_000
-DEC_COND_LEN = 10 * S3GEN_SR
 EXAGGERATION_TOKEN = 6563
 START_SPEECH_TOKEN = 6561
 STOP_SPEECH_TOKEN = 6562
