@@ -838,7 +838,7 @@ class PrepareConditionalsModel(torch.nn.Module):
 
         # Compute embed_ref
         ref_wav_24 = audio_values[..., :DEC_COND_LEN]
-        prompt_feat = self.mel_spectrogram(ref_wav_24).transpose(1, 2)
+        speaker_features = self.mel_spectrogram(ref_wav_24).transpose(1, 2)
 
         # Resample to 16kHz
         ref_wav_16 = self.resampler(audio_values) # resample uncropped audio
@@ -852,7 +852,7 @@ class PrepareConditionalsModel(torch.nn.Module):
 
         feature = self.extract_feature(ref_wav_16, num_mel_bins=80) # == Kaldi.fbank(ref_wav_16, num_mel_bins=80)
         feature = feature - feature.mean(dim=0, keepdim=True)
-        ref_x_vector = self.speaker_encoder(feature.unsqueeze(0))
+        speaker_embeddings = self.speaker_encoder(feature.unsqueeze(0))
 
         t3_cond_prompt_tokens = self.s3(ref_wav_16[..., :ENC_COND_LEN], max_len=self.speech_cond_prompt_len)
 
@@ -877,14 +877,14 @@ class PrepareConditionalsModel(torch.nn.Module):
             cond_prompt_speech_emb,
         ), dim=1)  # (B, len_cond, dim)
         # assert cond_emb.dim() == 3
-        return cond_emb, prompt_token, ref_x_vector, prompt_feat
+        return cond_emb, prompt_token, speaker_embeddings, speaker_features
 
     def forward(
         self,
         audio_values: torch.Tensor, # NOTE: Must have sample rate of S3GEN_SR=24000
     ):
-        cond_emb, prompt_token, ref_x_vector, prompt_feat = self.prepare_conditions_from_audio(audio_values)
-        return cond_emb, prompt_token, ref_x_vector, prompt_feat
+        cond_emb, prompt_token, speaker_embeddings, speaker_features = self.prepare_conditions_from_audio(audio_values)
+        return cond_emb, prompt_token, speaker_embeddings, speaker_features
 
 
 class InputsEmbeds(nn.Module):
@@ -1106,7 +1106,7 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
                     [0, 0, 1, 1, 1]]
     """
     batch_size = lengths.size(0)
-    max_len = max_len if max_len > 0 else lengths.max().item()
+    max_len = max_len if max_len > 0 else lengths.max()
     seq_range = torch.arange(0,
                             max_len,
                             dtype=torch.int64,
@@ -1122,35 +1122,6 @@ def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     mask = mask.to(dtype)
     mask = (1.0 - mask) * -1.0e+10
     return mask
-
-def pad_list(xs, pad_value):
-    """Perform padding for the list of tensors.
-
-    Args:
-        xs (List): List of Tensors [(T_1, `*`), (T_2, `*`), ..., (T_B, `*`)].
-        pad_value (float): Value for padding.
-
-    Returns:
-        Tensor: Padded tensor (B, Tmax, `*`).
-
-    Examples:
-        >>> x = [torch.ones(4), torch.ones(2), torch.ones(1)]
-        >>> x
-        [tensor([1., 1., 1., 1.]), tensor([1., 1.]), tensor([1.])]
-        >>> pad_list(x, 0)
-        tensor([[1., 1., 1., 1.],
-                [1., 1., 0., 0.],
-                [1., 0., 0., 0.]])
-
-    """
-    n_batch = len(xs)
-    max_len = max(x.size(0) for x in xs)
-    pad = xs[0].new(n_batch, max_len, *xs[0].size()[1:]).fill_(pad_value)
-
-    for i in range(n_batch):
-        pad[i, : xs[i].size(0)] = xs[i]
-
-    return pad
 
 
 class ConditionalDecoder(nn.Module):
@@ -1196,13 +1167,6 @@ class ConditionalDecoder(nn.Module):
             t (_type_): shape (batch_size)
             spks (_type_, optional): shape: (batch_size, condition_channels). Defaults to None.
             cond (_type_, optional): placeholder for future use. Defaults to None.
-
-        Raises:
-            ValueError: _description_
-            ValueError: _description_
-
-        Returns:
-            _type_: _description_
         """
 
         t = self.time_embeddings(t).to(t.dtype)
@@ -1277,16 +1241,17 @@ class ConditionalDecoder(nn.Module):
         text_encoded = self.encoder_proj(text_encoded)
 
         # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size] ).to(text_encoded.dtype)
+        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size]).to(text_encoded.dtype)
         conds[:, :mel_len1] = prompt_feat
         conds = conds.transpose(1, 2)
 
         mu = text_encoded
         spks = embedding
-        cond = conds
-        mel_len1 = torch.tensor(mel_len1, device=speech_tokens.device)
-        mel_len2 = torch.tensor(mel_len2, device=speech_tokens.device)
-        return mel_len1, mel_len2, mu, spks, cond
+        if not isinstance(mel_len1, torch.Tensor):
+            mel_len1 = torch.tensor(mel_len1, device=speech_tokens.device)
+        if not isinstance(mel_len2, torch.Tensor):
+            mel_len2 = torch.tensor(mel_len2, device=speech_tokens.device)
+        return mel_len1, mel_len2, mu, spks, conds
 
     def decode(self, x: torch.Tensor, s_stft: torch.Tensor) -> torch.Tensor:
         x = self.conv_pre(x)
@@ -1334,10 +1299,10 @@ class ConditionalDecoder(nn.Module):
 
         return magnitude, phase
 
-    def forward(self, speech_tokens, embedding, prompt_feat):
+    def forward(self, speech_tokens, speaker_embeddings, speaker_features):
         token_len = torch.full((speech_tokens.size(0),), speech_tokens.size(1), dtype=torch.long, device=speech_tokens.device)
         mask = (~make_pad_mask(token_len)).unsqueeze(-1)
-        mel_len1, mel_len2, mu, spks, cond = self.flow_forward(speech_tokens, token_len, mask, embedding, prompt_feat)
+        mel_len1, mel_len2, mu, spks, cond = self.flow_forward(speech_tokens, token_len, mask, speaker_embeddings, speaker_features)
         mu = mu.transpose(1, 2).contiguous()
         total_len = mel_len1.add(mel_len2).unsqueeze(0)
         mask = (~make_pad_mask(total_len)).unsqueeze(0)
@@ -1588,13 +1553,16 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
             export_params=True,
             opset_version=20,
             input_names=["audio_values"],
-            output_names=["audio_features", "audio_tokens", "speaker_embedding", "spectrogram"],
+            output_names=["audio_features", "audio_tokens", "speaker_embeddings", "speaker_features"],
             dynamic_axes={
                 "audio_values": {0: "batch_size", 1: "num_samples"},
                 "audio_features": {0: "batch_size", 1: "sequence_length"},
                 "audio_tokens": {0: "batch_size", 1: "audio_sequence_length"},
-                "speaker_embedding": {0: "batch_size"}, # , 1: "speaker_embedding_length"
-                "spectrogram": {0: "batch_size"},
+                "speaker_embeddings": {0: "batch_size"},
+                "speaker_features": {
+                    0: "batch_size",
+                    1: "feature_dim",
+                },
             },
         )
         print(f"✅ Speech Encoder ONNX export is completed. Model saved as 'speech_encoder.onnx'")
@@ -1602,7 +1570,7 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
 
     # Example run
     # audio_values = torch.randn(1, 0) if not audio_values else audio_values
-    cond_emb, prompt_token, ref_x_vector, prompt_feat = prepare_conditionals(audio_values=audio_values)
+    cond_emb, prompt_token, speaker_embeddings, speaker_features = prepare_conditionals(audio_values=audio_values)
 
     text_emb = embed_tokens(input_ids=input_ids, position_ids=position_ids, exaggeration=exaggeration)
 
@@ -1643,30 +1611,26 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
         inputs_embeds = next_token_emb
 
     speech_tokens = torch.cat([prompt_token, generate_tokens[:, 1:-1]], dim=1)
-    embedding = ref_x_vector
 
     if export_cond_decoder:
         torch.onnx.export(
             cond_decoder,
-            (speech_tokens, embedding, prompt_feat),
+            (speech_tokens, speaker_embeddings, speaker_features),
             f"{output_export_dir}/conditional_decoder.onnx",
             export_params=True,
             opset_version=17,
-            input_names=["speech_tokens", "embedding", "prompt_feat"],
-            output_names=["output_wavs"],
+            input_names=["speech_tokens", "speaker_embeddings", "speaker_features"],
+            output_names=["waveform"],
             dynamic_axes={
                 "speech_tokens": {
                     0: "batch_size",
-                    1: "feature_dim"
+                    1: "num_speech_tokens",
                 },
-
-                "embedding": {
-                    0: "batch_size", 
-                    1: "feature_dim",
+                "speaker_embeddings": {
+                    0: "batch_size",
                 },
-
-                "prompt_feat": {
-                    0: "batch_size", 
+                "speaker_features": {
+                    0: "batch_size",
                     1: "feature_dim",
                 },
                 "waveform": {0: 'batch_size', 1: 'num_samples'},
@@ -1676,14 +1640,16 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
 
     if export_prepare_conditions or export_cond_decoder:
         import onnxslim
+        import onnx
         for f in os.listdir(output_export_dir):
-            p = os.path.join(output_export_dir, f)
-            onnxslim.slim(p, p)
+            save_path = os.path.join(output_export_dir, f)
+            model = onnxslim.slim(save_path)
+            onnx.save_model(model, save_path, save_as_external_data=True, all_tensors_to_one_file=True, location=os.path.basename(save_path) + "_data")
 
     output = cond_decoder(
         speech_tokens=speech_tokens,
-        embedding=embedding,
-        prompt_feat=prompt_feat,
+        speaker_embeddings=speaker_embeddings,
+        speaker_features=speaker_features,
     )
 
     ta.save(output_file_name, output, S3GEN_SR)
