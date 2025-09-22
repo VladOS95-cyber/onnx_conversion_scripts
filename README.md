@@ -38,10 +38,10 @@ Some models may have extra dependencies — check their **to_onnx_conversion_scr
 
 📚 Supported Models
 
-| Model Name        | Source                    | Notes                                  | Original repos
-| ----------------- | ------------------------  | -------------------------------------  | ---------------
-| chatterbox        | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech       | [GitHub Link](https://github.com/resemble-ai/chatterbox)
-| ...               | ...                       | ...                                    |
+| Model Name        | Source                    | Notes                                  | Original repo                                            | ONNX repo
+| ----------------- | ------------------------  | -------------------------------------  | ---------------                                          | ------------
+| Chatterbox        | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech       | [GitHub Link](https://github.com/resemble-ai/chatterbox) | [HF Link](https://huggingface.co/onnx-community/chatterbox-ONNX)
+| ...               | ...                       | ...                                    | ...                                                      | ...
 
 (More models coming soon!)
 
