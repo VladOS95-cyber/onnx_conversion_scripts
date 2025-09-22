@@ -1,3 +1,5 @@
+# !pip install --upgrade torch==2.6.0+cpu torchaudio==2.6.0+cpu numpy==2.2.6 librosa==0.11.0 onnx==1.18.0 onnxslim==0.1.59
+
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -21,9 +23,9 @@ from tqdm import tqdm
 # Sampling rate of the inputs to S3TokenizerV2
 S3GEN_SR = 24000
 S3_SR = 16_000
-S3_HOP = 160  # 100 frames/sec
-S3_TOKEN_HOP = 640  # 25 tokens/sec
-S3_TOKEN_RATE = 25
+S3_HOP = 160
+S3_TOKEN_HOP = 640
+S3_TOKEN_RATE = 25 # 25 tokens/sec
 SPEECH_VOCAB_SIZE = 6561
 MILLISECONDS_TO_SECONDS = 0.001
 
@@ -1639,9 +1641,14 @@ def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=Fa
         print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'conditional_decoder.onnx'")
 
     if export_prepare_conditions or export_cond_decoder:
+        # https://github.com/inisis/OnnxSlim/issues/190#issuecomment-3314433214
+        # for this optimization logic onnxslim==0.1.68 must be used
+        os.environ['ONNXSLIM_THRESHOLD'] = '10000000000'
         import onnxslim
         import onnx
         for f in os.listdir(output_export_dir):
+            if not f.endswith(".onnx"):
+                continue
             save_path = os.path.join(output_export_dir, f)
             model = onnxslim.slim(save_path)
             onnx.save_model(model, save_path, save_as_external_data=True, all_tensors_to_one_file=True, location=os.path.basename(save_path) + "_data")

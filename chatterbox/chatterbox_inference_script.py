@@ -1,3 +1,5 @@
+# !pip install --upgrade onnxruntime==1.22.1 huggingface_hub==0.34.4 transformers==4.46.3 numpy==2.2.6 tqdm==4.67.1 librosa==0.11.0 soundfile==0.13.1
+
 import onnxruntime
 
 from huggingface_hub import hf_hub_download
@@ -9,8 +11,6 @@ import librosa
 import soundfile as sf
 
 S3GEN_SR = 24000
-
-# Sampling rate of the inputs to S3TokenizerV2
 START_SPEECH_TOKEN = 6561
 STOP_SPEECH_TOKEN = 6562
 
