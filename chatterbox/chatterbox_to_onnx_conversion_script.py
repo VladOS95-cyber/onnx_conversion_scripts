@@ -1,4 +1,4 @@
-# !pip install --upgrade torch==2.6.0+cpu torchaudio==2.6.0+cpu numpy==2.2.6 librosa==0.11.0 onnx==1.18.0 onnxslim==0.1.59
+# !pip install --upgrade torch==2.6.0 torchaudio==2.6.0 numpy==2.2.6 librosa==0.11.0 onnx==1.18.0 onnxslim==0.1.59
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -1488,13 +1488,19 @@ class ConditionalDecoder(nn.Module):
 
 
 @torch.no_grad()
-def export_model_to_onnx(export_prepare_conditions=False, export_cond_decoder=False, audio_prompt_path=None, output_export_dir=None, output_file_name="output.wav"):
+def export_model_to_onnx(
+    export_prepare_conditions=False, 
+    export_cond_decoder=False, 
+    audio_prompt_path=None, 
+    output_export_dir=None, 
+    output_file_name="output.wav", 
+    device="cpu"):
     from chatterbox.tts import ChatterboxTTS
     if output_export_dir:
         import os
         os.makedirs(output_export_dir, exist_ok=True)
 
-    chatterbox_model = ChatterboxTTS.from_pretrained(device="cpu")
+    chatterbox_model = ChatterboxTTS.from_pretrained(device=device)
 
     # replace DenseLayer of speake_encoder on custom SafeDenseLayer with exchanging BatchNorm1d layer on LayerNorm for ONNX export compatibility
     # we can safely do that because it does not affect inference as we do no need matching training dynamics
