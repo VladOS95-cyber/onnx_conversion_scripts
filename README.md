@@ -27,14 +27,12 @@ This project aims to make it easier to:
 
 ### 1. Clone the repository
 
-    git clone https://github.com/<your-username>/<your-repo>.git
+    git clone https://github.com/<your-username>/onnx_conversion_scripts.git
     cd <your-repo>
 
 ### 2. Install dependencies
     You'll need Python 3.8+ and pip:
-    pip install torch onnx onnxruntime
-
-Some models may have extra dependencies — check their **to_onnx_conversion_script.py for details.
+    See dependencies and version info in scripts respectively
 
 📚 Supported Models
 
