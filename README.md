@@ -31,15 +31,16 @@ This project aims to make it easier to:
     cd <your-repo>
 
 ### 2. Install dependencies
-    You'll need Python 3.8+ and pip:
-    See dependencies and version info in scripts respectively
+    You'll need Python 3.9+ and pip:
+    See dependencies and versions info in scripts respectively
 
 📚 Supported Models
 
-| Model Name        | Source                    | Notes                                  | Original repo                                            | ONNX repo
-| ----------------- | ------------------------  | -------------------------------------  | ---------------                                          | ------------
-| Chatterbox        | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech       | [GitHub Link](https://github.com/resemble-ai/chatterbox) | [HF Link](https://huggingface.co/onnx-community/chatterbox-ONNX)
-| ...               | ...                       | ...                                    | ...                                                      | ...
+| Model Name                | Source                    | Notes                                  | Original repo                                            | ONNX repo
+| -----------------         | ------------------------  | -------------------------------------  | ---------------                                          | ------------
+| Chatterbox                | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech       | [GitHub Link](https://github.com/resemble-ai/chatterbox) | [HF Link](https://huggingface.co/onnx-community/chatterbox-ONNX)
+| Chatterbox Multilingual   | resemble-ai/chatterbox-tts| Text to Speech, Speech to Speech       | [GitHub Link](https://github.com/resemble-ai/chatterbox) | [HF Link](https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX)
+| ...                       | ...                       | ...                                    | ...                                                      | ...
 
 (More models coming soon!)
 
