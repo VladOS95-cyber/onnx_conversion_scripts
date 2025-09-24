@@ -26,6 +26,7 @@ def export_model_to_onnx(
     output_export_dir=None, 
     output_file_name="output.wav", 
     device="cpu"):
+    # pip install chatterbox-tts==0.1.3 or 0.1.4
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
     if output_export_dir:
         import os
