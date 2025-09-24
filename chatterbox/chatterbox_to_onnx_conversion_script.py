@@ -1,4 +1,4 @@
-# !pip install --upgrade torch==2.6.0 torchaudio==2.6.0 numpy==2.2.6 librosa==0.11.0 onnx==1.18.0 onnxslim==0.1.59
+# !pip install --upgrade transformers==4.46.3 torch==2.6.0 torchaudio==2.6.0 numpy==2.2.6 librosa==0.11.0 onnx==1.18.0 onnxslim==0.1.59
 
 from dataclasses import dataclass
 from typing import Optional, Tuple

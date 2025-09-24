@@ -1,4 +1,4 @@
-# !pip install --upgrade onnxruntime==1.22.1 huggingface_hub==0.34.4 transformers==4.46.3 numpy==2.2.6 tqdm==4.67.1 librosa==0.11.0 soundfile==0.13.1
+# !pip install --upgrade onnxruntime==1.22.1 huggingface_hub==0.34.4 transformers==4.46.3 numpy==2.2.6 tqdm==4.67.1 librosa==0.11.0 soundfile==0.13.1 perth==1.0.0
 
 import onnxruntime
 
@@ -110,12 +110,10 @@ def run_inference(
                     for kv in ("key", "value")
                 }
                 attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
-                llm_position_ids = np.cumsum(attention_mask, axis=1, dtype=np.int64) - 1
 
             logits, *present_key_values = llama_with_past_session.run(None, dict(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                position_ids=llm_position_ids,
                 **past_key_values,
             ))
 
@@ -138,7 +136,6 @@ def run_inference(
 
             ## Update values for next generation loop
             attention_mask = np.concatenate([attention_mask, np.ones((batch_size, 1), dtype=np.int64)], axis=1)
-            llm_position_ids = llm_position_ids[:, -1:] + 1
             for j, key in enumerate(past_key_values):
                 past_key_values[key] = present_key_values[j]
 

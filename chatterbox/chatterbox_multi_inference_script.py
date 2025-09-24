@@ -1,4 +1,5 @@
-# !pip install --upgrade onnxruntime==1.22.1 huggingface_hub==0.34.4 transformers==4.46.3 numpy==2.2.6 tqdm==4.67.1 librosa==0.11.0 soundfile==0.13.1
+# !pip install --upgrade onnxruntime==1.22.1 huggingface_hub==0.34.4 transformers==4.46.3 numpy==2.2.6 tqdm==4.67.1 librosa==0.11.0 soundfile==0.13.1 perth==1.0.0
+# for Chinese, Japanese additionally pip install pkuseg==0.0.25 pykakasi==2.3.0
 
 import onnxruntime
 
@@ -70,7 +71,7 @@ class ChineseCangjieConverter:
         """Load Cangjie mapping from HuggingFace model repository."""        
         try:
             cangjie_file = hf_hub_download(
-                repo_id="ResembleAI/chatterbox",
+                repo_id="onnx-community/chatterbox-multilingual-ONNX",
                 filename="Cangjie5_TC.json",
             )
             
@@ -301,7 +302,7 @@ def run_inference(
 
         ort_embed_tokens_inputs = {
             "input_ids": input_ids,
-            "position_ids": position_ids,
+            "position_ids": position_ids.astype(np.int64),
             "exaggeration": np.array([exaggeration], dtype=np.float32)
         }
 
@@ -313,7 +314,7 @@ def run_inference(
         num_key_value_heads = 16
         head_dim = 64
 
-        generate_tokens = np.array([[START_SPEECH_TOKEN]], dtype=np.long)
+        generate_tokens = np.array([[START_SPEECH_TOKEN]])
 
         # ---- Generation Loop using kv_cache ----
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
@@ -334,12 +335,9 @@ def run_inference(
                     for kv in ("key", "value")
                 }
                 attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
-                llm_position_ids = np.cumsum(attention_mask, axis=1, dtype=np.int64) - 1
-
             logits, *present_key_values = llama_with_past_session.run(None, dict(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                position_ids=llm_position_ids,
                 **past_key_values,
             ))
 
@@ -362,7 +360,6 @@ def run_inference(
 
             ## Update values for next generation loop
             attention_mask = np.concatenate([attention_mask, np.ones((batch_size, 1), dtype=np.int64)], axis=1)
-            llm_position_ids = llm_position_ids[:, -1:] + 1
             for j, key in enumerate(past_key_values):
                 past_key_values[key] = present_key_values[j]
 
