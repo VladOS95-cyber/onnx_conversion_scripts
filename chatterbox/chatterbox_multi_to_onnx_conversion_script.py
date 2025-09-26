@@ -82,7 +82,7 @@ def export_model_to_onnx(
                 "exaggeration": {0: "batch_size"},
             },
         )
-        print(f"✅ Embedding Tokens ONNX export is completed. Model saved as 'multi_lang_embed_tokens.onnx'")
+        print(f"✅ Embedding Tokens ONNX export is completed. Model saved as 'embed_tokens.onnx'")
 
         dummy_audio_values = torch.randn(1, 312936)
         torch.onnx.export(
@@ -104,7 +104,7 @@ def export_model_to_onnx(
                 },
             },
         )
-        print(f"✅ Speech Encoder ONNX export is completed. Model saved as 'multi_lang_speech_encoder.onnx'")
+        print(f"✅ Speech Encoder ONNX export is completed. Model saved as 'speech_encoder.onnx'")
 
 
     # Example run
@@ -175,7 +175,7 @@ def export_model_to_onnx(
                 "waveform": {0: 'batch_size', 1: 'num_samples'},
             }
         )
-        print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'multi_lang_conditional_decoder.onnx'")
+        print(f"✅ Conditional decoder ONNX export is completed. Model saved as 'conditional_decoder.onnx'")
 
     if export_prepare_conditions or export_cond_decoder:
         # https://github.com/inisis/OnnxSlim/issues/190#issuecomment-3314433214

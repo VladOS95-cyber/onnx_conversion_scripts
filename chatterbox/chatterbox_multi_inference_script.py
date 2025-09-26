@@ -268,12 +268,12 @@ def run_inference(
         target_voice_path = hf_hub_download(repo_id=model_id, filename="default_voice.wav", local_dir=output_dir)
 
     ## Load model
-    speech_encoder_path = hf_hub_download(repo_id=model_id, filename="multi_lang_speech_encoder.onnx", local_dir=output_dir, subfolder='onnx')
-    hf_hub_download(repo_id=model_id, filename="multi_lang_speech_encoder.onnx_data", local_dir=output_dir, subfolder='onnx')
-    embed_tokens_path = hf_hub_download(repo_id=model_id, filename="multi_lang_embed_tokens.onnx", local_dir=output_dir, subfolder='onnx')
-    hf_hub_download(repo_id=model_id, filename="multi_lang_embed_tokens.onnx_data", local_dir=output_dir, subfolder='onnx')
-    conditional_decoder_path = hf_hub_download(repo_id=model_id, filename="multi_lang_conditional_decoder.onnx", local_dir=output_dir, subfolder='onnx')
-    hf_hub_download(repo_id=model_id, filename="multi_lang_conditional_decoder.onnx_data", local_dir=output_dir, subfolder='onnx')
+    speech_encoder_path = hf_hub_download(repo_id=model_id, filename="speech_encoder.onnx", local_dir=output_dir, subfolder='onnx')
+    hf_hub_download(repo_id=model_id, filename="speech_encoder.onnx_data", local_dir=output_dir, subfolder='onnx')
+    embed_tokens_path = hf_hub_download(repo_id=model_id, filename="embed_tokens.onnx", local_dir=output_dir, subfolder='onnx')
+    hf_hub_download(repo_id=model_id, filename="embed_tokens.onnx_data", local_dir=output_dir, subfolder='onnx')
+    conditional_decoder_path = hf_hub_download(repo_id=model_id, filename="conditional_decoder.onnx", local_dir=output_dir, subfolder='onnx')
+    hf_hub_download(repo_id=model_id, filename="conditional_decoder.onnx_data", local_dir=output_dir, subfolder='onnx')
     language_model_path = hf_hub_download(repo_id=model_id, filename="language_model.onnx", local_dir=output_dir, subfolder='onnx')
     hf_hub_download(repo_id=model_id, filename="language_model.onnx_data", local_dir=output_dir, subfolder='onnx')
 
@@ -387,8 +387,9 @@ def run_inference(
 
 if __name__ == "__main__":
     run_inference(
-        text="Ezreal and Jinx teamed up with Ahri, Yasuo, and Teemo to take down the enemy's Nexus in an epic late-game pentakill.",
-        language_id="en",
+        target_voice_path="Sophia.wav",
+        text="Bonjour, comment ça va? Ceci est le modèle de synthèse vocale multilingue Chatterbox, il prend en charge 23 langues.",
+        language_id="fr",
         exaggeration=0.5,
         output_file_name="output.wav",
         apply_watermark=False,
