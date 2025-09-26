@@ -387,7 +387,6 @@ def run_inference(
 
 if __name__ == "__main__":
     run_inference(
-        target_voice_path="Sophia.wav",
         text="Bonjour, comment ça va? Ceci est le modèle de synthèse vocale multilingue Chatterbox, il prend en charge 23 langues.",
         language_id="fr",
         exaggeration=0.5,
